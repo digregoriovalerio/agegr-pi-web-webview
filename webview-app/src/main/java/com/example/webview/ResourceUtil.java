@@ -6,7 +6,20 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Utility class for loading classpath resources.
+ * Utility class for loading text resources from the classpath.
+ *
+ * <h2>Purpose</h2>
+ * Loads JavaScript resources (e.g. {@code bridge.js}, {@code autoHello.js})
+ * from the classpath at runtime. Tries the source class's classloader first,
+ * then falls back to the context classloader (important for modular or
+ * isolated classloader scenarios).
+ *
+ * <h2>Why not inline JS strings?</h2>
+ * PowerShell corrupts Java text blocks ({@code """}) — multi-line JS strings
+ * in Java files break compilation. All JavaScript must live in
+ * {@code src/main/resources/*.js} and be loaded via {@link #readResource}.
+ *
+ * @see AppLogger
  */
 public final class ResourceUtil {
 
@@ -18,11 +31,10 @@ public final class ResourceUtil {
 
     /**
      * Reads a text resource from the classpath.
-     * Tries the source class's classloader first, then falls back to context classloader.
      *
-     * @param name resource name (e.g., "bridge.js")
+     * @param name        resource name (e.g. {@code bridge.js})
      * @param sourceClass class to use for classloader resolution (typically the caller)
-     * @return resource content as UTF-8 string, or null if not found
+     * @return resource content as UTF-8 string, or {@code null} if not found
      */
     public static String readResource(String name, Class<?> sourceClass) {
         // Try source class's classloader first
@@ -32,7 +44,7 @@ public final class ResourceUtil {
             return result;
         }
 
-        // Fallback to context classloader (important for modular/classloader isolation scenarios)
+        // Fallback to context classloader
         cl = Thread.currentThread().getContextClassLoader();
         if (cl != sourceClass.getClassLoader()) {
             result = readResourceWithLoader(name, cl);

@@ -22,26 +22,79 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * A standalone HTTP proxy built on a raw {@link ServerSocket}.
  *
- * Used to work around JavaFX WebView's inability to connect to certain localhost
- * servers (e.g. pi-web on 127.0.0.1:30141). The proxy rewrites Origin/Referer
- * headers to the target origin and injects a browser-like User-Agent so that
- * server-side origin checks and browser sniffing pass.
+ * <h2>Why this class exists</h2>
+ * JavaFX WebView cannot connect reliably to localhost servers such as pi-web
+ * on {@code 127.0.0.1:30141}. It fails origin checks, sends the wrong
+ * User-Agent, and does not handle SSE streaming or chunked transfer encoding
+ * correctly. This proxy sits between the WebView page and pi-web:
+ * <ul>
+ *   <li>Rewrites {@code Origin} and {@code Referer} headers to the target origin</li>
+ *   <li>Injects a browser-like {@code User-Agent}</li>
+ *   <li>Strips restricted headers (Host, Connection, Sec-*, etc.)</li>
+ *   <li>Pipes streaming (SSE/event-stream) responses incrementally</li>
+ *   <li>Validates request paths for SSRF protection</li>
+ *   <li>Handles both Content-Length and chunked request bodies</li>
+ * </ul>
  *
- * Streaming responses (SSE/event-stream) are piped incrementally so LLM
- * token streams reach the WebView as they arrive — no buffering, so
- * event-stream connections don't time out.
+ * <h2>Architecture diagram</h2>
+ * <pre>
+ *   WebView page --> Proxy --> Target (pi-web)
+ *      ^                       |
+ *      |                       v
+ *   Proxy <-- Target response <--+
+ *   Proxy --> WebView page
+ * </pre>
  *
- * Communication logged:
- *   Client -> Proxy   : incoming HTTP request
- *   Proxy   -> Target : forwarded HTTP request
- *   Target  -> Proxy  : HTTP response
- *   Proxy   -> Client : HTTP response forwarded back
+ * <h2>Communication edges logged</h2>
+ * <ul>
+ *   <li>{@code Client -> Proxy} — incoming HTTP request</li>
+ *   <li>{@code Proxy -> Target} — forwarded HTTP request</li>
+ *   <li>{@code Target -> Proxy} — HTTP response</li>
+ *   <li>{@code Proxy -> Client} — response forwarded back to WebView</li>
+ * </ul>
  *
- * Usage:
- *   ProxyServer proxy = new ProxyServer("http://127.0.0.1:30141", 0, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout, maxRequestBodySize);
- *   proxy.start();
- *   int port = proxy.getListenPort();
- *   proxy.stop();
+ * <h2>Critical bug fixes in this class</h2>
+ * <h3>Bug 1: POST body double-read (fixed)</h3>
+ * The original code called {@link #readRequest(InputStream)} which already
+ * consumed the <b>full</b> request (headers + body) from the client socket.
+ * Then {@code handleClient} tried to read {@code Content-Length} more bytes
+ * from {@code clientIn} again. Since the client had already sent everything,
+ * that second read blocked until the 300-second socket read timeout, and the
+ * message POST never reached pi-web.
+ * <p>
+ * Fix: {@code readRequest()} returns the complete raw request (headers +
+ * body). The body is extracted from the already-read byte array via
+ * {@link #extractBody(byte[], int, Map)} — never re-read from the socket.
+ *
+ * <h3>Bug 2: getOutputStream() + explicit connect() = "Already connected"
+ * (fixed)</h3>
+ * {@code HttpURLConnection.getOutputStream()} implicitly calls
+ * {@code connect()}. The original code then called {@code conn.connect()}
+ * explicitly afterward, which threw {@code IllegalStateException:
+ * Already connected} on every POST/PUT/PATCH/DELETE request.
+ * <p>
+ * Fix: Removed all explicit {@code conn.connect()} calls. Headers are set
+ * first, then {@code setDoOutput(true)} + {@code getOutputStream()} writes
+ * the body (implicitly connecting), then {@code getResponseCode()} reads the
+ * response.
+ *
+ * <h3>Bug 3: Chunked request body parsing (fixed)</h3>
+ * The original incremental chunk parser was fragile: it tracked offsets into
+ * a fixed buffer with complex state transitions that could misparse chunk
+ * size lines split across reads.
+ * <p>
+ * Fix: Replaced with an accumulate-and-dechunk approach
+ * ({@link #readChunkedRequest} + {@link #tryDechunk}) that buffers all raw
+ * chunked bytes in memory, then parses them as complete ASCII framing lines.
+ *
+ * <h2>SSRF protection</h2>
+ * Request paths must start with {@code /} and must not be absolute-form URIs
+ * ({@code scheme://host/...}) or contain path traversal ({@code ../}).
+ * Violations return HTTP 400.
+ *
+ * @see AppConfig
+ * @see AppLogger
+ * @see ProxiedWebView
  */
 public class ProxyServer {
 
@@ -71,15 +124,15 @@ public class ProxyServer {
     private final AtomicInteger connectionCounter = new AtomicInteger(0);
 
     /**
-     * Create a proxy that forwards to the given target origin.
+     * Creates a proxy that forwards to the given target origin.
      *
-     * @param targetOrigin full target origin (e.g. "http://127.0.0.1:30141")
-     * @param listenPort local port to bind (0 = random available port)
-     * @param proxyHost proxy bind host
-     * @param bufferSize streaming buffer size
-     * @param userAgent User-Agent for forwarding
-     * @param connectTimeout connection timeout (ms)
-     * @param sseReadTimeout SSE read timeout (ms)
+     * @param targetOrigin       full target origin (e.g. {@code http://127.0.0.1:30141})
+     * @param listenPort         local port to bind (0 = random available port)
+     * @param proxyHost          proxy bind host
+     * @param bufferSize         streaming buffer size (bytes)
+     * @param userAgent          User-Agent for forwarding to target
+     * @param connectTimeout     connection timeout (ms)
+     * @param sseReadTimeout     SSE read timeout (ms)
      * @param maxRequestBodySize max request body size (bytes)
      */
     public ProxyServer(
@@ -104,7 +157,11 @@ public class ProxyServer {
             + ", listenPort=" + listenPort + ", bufferSize=" + bufferSize);
     }
 
-    /** Start the proxy server. */
+    /**
+     * Starts the proxy server on a background thread.
+     *
+     * @throws IOException if the server socket cannot be opened
+     */
     public void start() throws IOException {
         serverSocket = new ServerSocket(listenPort);
         serverSocket.setReuseAddress(true);
@@ -131,6 +188,14 @@ public class ProxyServer {
         }
     }
 
+    /**
+     * Handles a single client connection end-to-end: reads the request,
+     * forwards it to the target origin, reads the response, and sends it back
+     * to the client.
+     *
+     * @param clientSocket the client socket
+     * @param connId       connection identifier for logging
+     */
     private void handleClient(Socket clientSocket, int connId) {
         String clientAddr = clientSocket.getInetAddress().getHostAddress();
         String method = "UNKNOWN";
@@ -315,6 +380,10 @@ public class ProxyServer {
         }
     }
 
+    /**
+     * Pipes bytes from an input stream to an output stream until EOF,
+     * logging each chunk at TRACE level.
+     */
     private void pipe(InputStream in, OutputStream out, int connId, String method, String path) throws IOException {
         byte[] buf = new byte[bufferSize];
         int read;
@@ -328,6 +397,11 @@ public class ProxyServer {
         out.flush();
     }
 
+    /**
+     * Reads the complete HTTP request (headers + body) from the client socket.
+     * The body is consumed entirely here so it does not need to be re-read
+     * later.
+     */
     private byte[] readRequest(InputStream in) throws IOException {
         // First, read headers
         byte[] buf = new byte[bufferSize];
@@ -404,7 +478,8 @@ public class ProxyServer {
     }
 
     /**
-     * Find the start of the "\r\n\r\n" header terminator in the raw request bytes.
+     * Finds the start of the {@code \r\n\r\n} header terminator in raw
+     * request bytes.
      */
     private static int indexOfHeaderEnd(byte[] buf) {
         for (int i = 0; i + 3 < buf.length; i++) {
@@ -416,10 +491,10 @@ public class ProxyServer {
     }
 
     /**
-     * Extract the request body from the raw request bytes.
-     * readRequest() already consumed the body from the socket (and de-chunked
-     * chunked bodies), so the body is sliced from reqBuf — never re-read from
-     * the client stream (which would block until the read timeout).
+     * Extracts the request body from the already-read request bytes.
+     * {@code readRequest()} already consumed the body from the socket (and
+     * de-chunked chunked bodies), so the body is sliced from {@code reqBuf} —
+     * never re-read from the client stream.
      */
     private byte[] extractBody(byte[] reqBuf, int bodyStart, Map<String, String> headers) throws IOException {
         int available = reqBuf.length - bodyStart;
@@ -448,13 +523,13 @@ public class ProxyServer {
     }
 
     /**
-     * Read a chunked request body, de-chunk it in memory, and return the
+     * Reads a chunked request body, de-chunks it in memory, and returns the
      * raw request (headers + de-chunked body).
      *
-     * This replaces the fragile incremental chunk parser with a simpler
-     * accumulate-and-dechunk approach. The chunked encoding uses ASCII
-     * framing, so we can safely operate on the accumulated raw bytes and
-     * parse chunk-size lines as strings without corrupting binary data.
+     * Uses an accumulate-and-dechunk approach: all raw chunked bytes are
+     * buffered, then {@link #tryDechunk} parses them as complete ASCII
+     * framing lines. This avoids the fragile incremental offset tracking of
+     * the previous implementation.
      */
     private byte[] readChunkedRequest(InputStream in, byte[] headerBuf, int headerEnd, int bodyStart, int bodyPresent) throws IOException {
         // Accumulate the raw chunked bytes and de-chunk in memory.
@@ -483,9 +558,10 @@ public class ProxyServer {
     }
 
     /**
-     * Attempt to de-chunk the accumulated raw request body bytes.
-     * Returns the de-chunked body, or null if the buffer does not yet contain
-     * the complete chunked body (terminating 0-chunk consumed).
+     * Attempts to de-chunk accumulated raw request body bytes.
+     *
+     * @return the de-chunked body, or {@code null} if the buffer does not yet
+     *         contain the complete chunked body (terminating 0-chunk consumed)
      */
     private static byte[] tryDechunk(byte[] raw, int maxBodySize) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -573,8 +649,11 @@ public class ProxyServer {
     }
 
     /**
-     * Validate request path to prevent SSRF.
-     * Rejects absolute-form URIs (e.g., "http://evil.com/") and path traversal.
+     * Validates a request path to prevent SSRF attacks.
+     *
+     * @param path the request path
+     * @return {@code true} if the path is valid, {@code false} if it is an
+     *         absolute-form URI, contains path traversal, or is empty
      */
     private static boolean isValidRequestPath(String path) {
         if (path == null || path.isEmpty()) {
@@ -595,7 +674,7 @@ public class ProxyServer {
         return true;
     }
 
-    /** Send an error response to the client. */
+    /** Sends an HTTP error response to the client. */
     private void sendErrorResponse(OutputStream out, int statusCode, String message) throws IOException {
         String statusMsg;
         switch (statusCode) {
@@ -616,7 +695,7 @@ public class ProxyServer {
         out.flush();
     }
 
-    /** Stop the proxy server. */
+    /** Stops the proxy server and shuts down its thread pool. */
     public void stop() {
         running = false;
         try {
@@ -644,7 +723,7 @@ public class ProxyServer {
         return listenPort;
     }
 
-    /** Returns the full target origin URL (e.g. "http://127.0.0.1:30141"). */
+    /** Returns the full target origin URL (e.g. {@code http://127.0.0.1:30141}). */
     public String getTargetOrigin() {
         return targetOrigin;
     }

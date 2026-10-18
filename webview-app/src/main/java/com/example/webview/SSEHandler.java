@@ -19,16 +19,73 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * SSEHandler manages Server-Sent Events (SSE) streaming between the target server
- * and the JavaFX WebView page.
+ * SSEHandler manages Server-Sent Events (SSE) streaming between the target
+ * server and the JavaFX WebView page.
  *
- * Communication flow:
- *   Page JS (EventSource polyfill) --__PI_SSE_START__:url--> JSBridge --postMessage--> ProxiedWebView --callback--> SSEHandler.start(url)
- *   SSEHandler --HTTP GET--> Target SSE endpoint
- *   Target SSE endpoint --events--> SSEHandler --sendToPage--> ProxiedWebView --executeScript--> Page JS (receiveMessageFromJava)
- *   Page JS (EventSource.close) --__PI_SSE_STOP__:url--> JSBridge --postMessage--> ProxiedWebView --callback--> SSEHandler.stop(url)
+ * <h2>Purpose</h2>
+ * JavaFX WebView does not expose a working native {@code EventSource}, so
+ * pi-web's chat replies (streamed via SSE on {@code /api/agent/{id}/events})
+ * cannot reach the page directly. This class opens an outbound HTTP GET to
+ * the SSE endpoint on behalf of the page, reads events as they arrive, and
+ * pushes each one back into the page via
+ * {@link ProxiedWebView#sendToPage(String)} →
+ * {@code window.receiveMessageFromJava(msg)}.
  *
- * All configuration is passed via individual constructor parameters.
+ * <h2>Architecture diagram</h2>
+ * <pre>
+ *   Page JS (EventSource polyfill)
+ *       --__PI_SSE_START__:url--> JSBridge --postMessage--> ProxiedWebView
+ *                                                      |
+ *                                                      v (callback)
+ *                                                SSEHandler.start(url)
+ *                                                      |
+ *                                                      v (HTTP GET)
+ *                                               Target SSE endpoint
+ *                                                      |
+ *                                                      v (events/chunks)
+ *                                                SSEHandler
+ *                                                      |
+ *                                                      v (sendToPage)
+ *                                               ProxiedWebView
+ *                                                      |
+ *                                                      v (executeScript)
+ *                                               Page JS (receiveMessageFromJava)
+ *                                                      |
+ *                                                       (EventSource.close)
+ *       --__PI_SSE_STOP__:url--> JSBridge --postMessage--> ProxiedWebView
+ *                                                      |
+ *                                                      v (callback)
+ *                                                SSEHandler.stop(url)
+ * </pre>
+ *
+ * <h2>Critical bug fix: relative SSE URLs (fixed)</h2>
+ * pi-web's frontend opens SSE streams with relative URLs like
+ * {@code /api/agent/${id}/events}. The EventSource polyfill forwards the raw
+ * string to {@code __PI_SSE_START__}. The original code passed that string
+ * directly to {@code URI.create().toURL()}, which throws
+ * {@code IllegalArgumentException: URI is not absolute} for relative URLs —
+ * so the reply stream never opened and no chat responses ever reached the GUI.
+ * <p>
+ * Fix: {@link #start(String)} now detects relative URLs (no scheme) and
+ * resolves them against the target origin before opening the connection.
+ *
+ * <h2>Stream lifecycle</h2>
+ * Each SSE stream runs on its own thread from a bounded executor pool (4
+ * threads). Stream state (running flag + leftover buffer) is tracked per URL
+ * so that stop requests can interrupt the correct reader. SSE data is
+ * parsed incrementally: chunks are buffered, split on {@code \n\n} event
+ * boundaries, and each complete event is sent to the page.
+ *
+ * <h2>Communication edges logged</h2>
+ * <ul>
+ *   <li>{@code SSEHandler -> Target} — SSE stream open</li>
+ *   <li>{@code Target -> SSEHandler} — SSE events/chunks</li>
+ *   <li>{@code SSEHandler -> Page} — SSE events via sendToPage</li>
+ * </ul>
+ *
+ * @see ProxiedWebView
+ * @see JSBridge
+ * @see AppLogger
  */
 public class SSEHandler {
 
@@ -40,7 +97,7 @@ public class SSEHandler {
     private final int connectTimeout;
     private final int sseReadTimeout;
 
-    /** Executor for SSE reader threads (bounded pool). */
+    /** Executor for SSE reader threads (bounded pool, 4 threads). */
     private final ExecutorService executor = Executors.newFixedThreadPool(
         4,
         new ThreadFactory() {
@@ -60,19 +117,18 @@ public class SSEHandler {
         final StringBuilder leftover = new StringBuilder();
     }
 
-    // Tracks active SSE streams opened by the EventSource polyfill in the page.
-    // Value is a StreamState containing the running flag and leftover buffer.
+    /** Tracks active SSE streams keyed by URL. */
     private final Map<String, StreamState> sseStreams = new ConcurrentHashMap<>();
 
     /**
-     * Create an SSE handler attached to a ProxiedWebView.
+     * Creates an SSE handler attached to a ProxiedWebView.
      *
      * @param proxiedWebView the view used to send events back to the page
-     * @param proxyHost proxy host for Origin/Referer headers
-     * @param bufferSize streaming buffer size
-     * @param userAgent User-Agent for SSE requests
+     * @param proxyHost      proxy host for Origin/Referer headers
+     * @param bufferSize     streaming buffer size (bytes)
+     * @param userAgent      User-Agent for SSE requests
      * @param connectTimeout connection timeout (ms)
-     * @param sseReadTimeout SSE read timeout (ms)
+     * @param sseReadTimeout SSE stream read timeout (ms)
      */
     public SSEHandler(
         ProxiedWebView proxiedWebView,
@@ -92,10 +148,12 @@ public class SSEHandler {
     }
 
     /**
-     * Handle a __PI_SSE_START__ message from the page. Opens a background thread
-     * that reads the SSE stream and pushes each chunk back into the page.
+     * Handles a {@code __PI_SSE_START__} message from the page. Opens a
+     * background thread that reads the SSE stream and pushes each chunk back
+     * into the page via {@link ProxiedWebView#sendToPage(String)}.
      *
-     * @param sseUrl the SSE stream URL
+     * @param sseUrl the SSE stream URL (may be relative, e.g.
+     *               {@code /api/agent/.../events})
      */
     public void start(String sseUrl) {
         LOG.info("SSEHandler", "START requested for " + sseUrl);
@@ -194,7 +252,8 @@ public class SSEHandler {
     }
 
     /**
-     * Process a chunk of SSE data, extracting and dispatching complete events.
+     * Processes a chunk of SSE data, extracting and dispatching complete
+     * events (delimited by {@code \n\n}) to the page.
      */
     private void processSSEChunk(StreamState state) {
         String data = state.leftover.toString();
@@ -217,7 +276,9 @@ public class SSEHandler {
     }
 
     /**
-     * Handle a __PI_SSE_STOP__ message from the page. Stops the SSE reader thread.
+     * Handles a {@code __PI_SSE_STOP__} message from the page. Stops the
+     * SSE reader thread for the given URL and flushes any remaining
+     * buffered data.
      *
      * @param sseUrl the SSE stream URL to stop
      */
@@ -242,7 +303,7 @@ public class SSEHandler {
         }
     }
 
-    /** Stop all active SSE streams. Call on application shutdown. */
+    /** Stops all active SSE streams. Call on application shutdown. */
     public void stopAll() {
         LOG.info("SSEHandler", "Stopping all " + sseStreams.size() + " streams");
         for (Map.Entry<String, StreamState> entry : sseStreams.entrySet()) {

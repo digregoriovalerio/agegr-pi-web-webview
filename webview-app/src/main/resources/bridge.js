@@ -1,9 +1,37 @@
 (function() {
+  // ===========================================================================
+  // bridge.js — JS bridge installation + EventSource polyfill + SSE state
+  // ===========================================================================
+  //
+  // PURPOSE:
+  //   Installs a JavaScript bridge into the WebView page so that:
+  //     1. Console output (console.log, console.error, window.onerror) is
+  //        captured and sent to Java via javaBridge.log/error.
+  //     2. A working EventSource polyfill is provided (JavaFX WebView lacks
+  //        a usable native EventSource).
+  //     3. SSE events received from Java (via window.receiveMessageFromJava)
+  //        are parsed and dispatched to page event listeners.
+  //
+  // ARCHITECTURE:
+  //   This script is executed by ProxiedWebView.installJSBridge() on every
+  //   successful page load. It is guarded by window.__piBridgeInstalled so
+  //   the IIFE body only runs once per document.
+  //
+  // COMMUNICATION FLOW:
+  //   Page JS --> javaBridge.log/error      : console capture -> Java
+  //   Page JS --> javaBridge.postMessage    : __PI_SSE_START__/STOP__ -> SSEHandler
+  //   Java --> window.receiveMessageFromJava: SSE events -> Page JS
+  //
+  // ===========================================================================
+
   if (window.__piBridgeInstalled) return;
   window.__piBridgeInstalled = true;
   if (window.javaBridge) javaBridge.log("[bridge] script executing");
 
   // --- Console capture ---
+  // Intercepts console.log and console.error so their output is forwarded to
+  // Java via javaBridge.log/error. Each call is wrapped in try/catch so a
+  // missing or GC'd javaBridge never breaks the page.
   window.onerror = function(msg, url, line) {
     if (window.javaBridge) javaBridge.error(String(msg) + ' at ' + url + ':' + line);
     return false;
@@ -14,6 +42,9 @@
   console.error = function() { origError.apply(console, arguments); if (window.javaBridge) javaBridge.error(Array.prototype.join.call(arguments, ' ')); };
 
   // --- Global SSE state object ---
+  // Shared by the EventSource polyfill and window.receiveMessageFromJava.
+  // Buffers incoming SSE data, parses complete events (\n\n delimited), and
+  // dispatches them to registered listeners.
   window.__piSSE = {
     _closed: false,
     _buffer: '',
@@ -24,7 +55,7 @@
     url: '',
     readyState: 0,
     _listeners: [],
-    _maxPendingSize: 100,  // Prevent unbounded growth
+    _maxPendingSize: 100,
     flush: function() {
       if (this._pending.length === 0) return;
       var events = this._pending.splice(0, this._pending.length);
@@ -69,18 +100,15 @@
         } else if (line.startsWith("data:")) {
           payload = line.substring(5);
         } else if (line.startsWith("id: ")) {
-          // Last-Event-ID - could be used for reconnection
           this._lastEventId = line.substring(4).trim();
         } else if (line.startsWith("retry: ")) {
-          // Reconnection delay - could be used for reconnection
           this._retry = parseInt(line.substring(7).trim(), 10);
         }
         if (payload !== '') {
           var evt = new MessageEvent(eventType, {data: payload});
           this._pending.push(evt);
-          // Prevent unbounded queue growth
           if (this._pending.length > this._maxPendingSize) {
-            this._pending.shift(); // Drop oldest event
+            this._pending.shift();
           }
         }
       }
@@ -89,6 +117,8 @@
   };
 
   // --- Receive messages from Java ---
+  // Called by ProxiedWebView.sendToPage() via window.executeScript.
+  // Appends the message to the SSE buffer and processes complete events.
   window.receiveMessageFromJava = function(msg) {
     try {
       if (window.javaBridge) javaBridge.log("[bridge] [receiveMessageFromJava] got " + (msg ? msg.substring(0, Math.min(80, msg.length)) + "..." : 'null'));
@@ -104,6 +134,10 @@
   };
 
   // --- EventSource polyfill for JavaFX WebView ---
+  // JavaFX WebView lacks a working native EventSource. This polyfill opens
+  // SSE streams by posting __PI_SSE_START__ to javaBridge, which Java handles
+  // by opening an HTTP connection to the SSE endpoint and streaming events
+  // back via receiveMessageFromJava.
   (function installEventSourcePolyfill() {
     if (window.__piEventSourcePatched) return;
     window.__piEventSourcePatched = true;
@@ -127,7 +161,9 @@
           window.javaBridge.postMessage("__PI_SSE_START__:" + url);
           bridged = true;
         } catch (e) {
-          // javaBridge exists but is broken (e.g. GC'd bridge object) — fall back
+          // javaBridge exists but is broken (e.g. GC'd bridge object) — fall
+          // back to native EventSource so the page at least degrades
+          // gracefully instead of silently failing.
           try { window.javaBridge.log("[bridge] [EventSource] postMessage failed, falling back to native EventSource: " + e); } catch (e2) {}
           bridged = false;
         }
@@ -173,7 +209,7 @@
     window.EventSource.prototype._scheduleReconnect = function() {
       var self = this;
       if (self._closed) return;
-      var delay = self._retry || 2000; // Default 2s, can be overridden by server
+      var delay = self._retry || 2000;
       self._reconnectTimer = setTimeout(function() {
         if (!self._closed) {
           try {

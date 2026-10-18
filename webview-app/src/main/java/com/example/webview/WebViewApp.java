@@ -15,27 +15,50 @@ import javafx.scene.layout.Priority;
 import javafx.stage.Stage;
 
 /**
- * Main application entry point.
+ * Main application entry point and GUI shell.
  *
- * WebViewApp is responsible ONLY for GUI logic:
- *   - Creating the JavaFX stage and scene
- *   - Creating the ProxiedWebView
- *   - Address bar handling (text field + navigation)
- *   - Navigation buttons (back, forward, reload)
+ * <h2>What this class does</h2>
+ * {@code WebViewApp} is the JavaFX {@link Application} that builds the user
+ * interface. It is <b>GUI-only</b>: it creates the window, address bar, and
+ * navigation buttons, then hands off all networking, proxying, JS bridging,
+ * and SSE streaming to {@link ProxiedWebView}.
  *
- * All network, proxy, JS bridging, SSE, and auto-hello logic lives in
- * ProxiedWebView / ProxyServer / JSBridge / SSEHandler / AutoHello respectively.
- * SSE messages (__PI_SSE_START__ / __PI_SSE_STOP__) are handled internally by
- * ProxiedWebView -> SSEHandler, so WebViewApp does not need a message callback.
+ * <h2>Architecture role</h2>
+ * {@code WebViewApp} owns a {@link ProxiedWebView} instance and places it in
+ * the center of a {@link BorderPane}. A toolbar above contains back/forward/
+ * reload buttons, an address bar, and a "Go" button.
  *
- * Flow:
- *   1. User enters URL in address bar and presses Enter
- *   2. WebViewApp calls ProxiedWebView.navigateTo(url)
- *   3. ProxiedWebView rewrites URL through ProxyServer and loads it
- *   4. Page loads, JS bridge installed, EventSource polyfill active
- *   5. AutoHello (dev only) may submit "Hello" automatically
- *   6. SSE messages flow: Page -> JSBridge -> ProxiedWebView -> SSEHandler -> Target
- *   7. SSE events flow back: Target -> SSEHandler -> ProxiedWebView -> Page JS
+ * <h2>User flow</h2>
+ * <ol>
+ *   <li>The app starts {@code ProxiedWebView}, which launches a local HTTP
+ *       proxy on a random port.</li>
+ *   <li>The app navigates to {@link AppConfig#TARGET_ORIGIN} (pi-web) through
+ *       that proxy.</li>
+ *   <li>When the page finishes loading, the JS bridge is installed and (if
+ *       enabled) AutoHello automatically types "Hello" into the chat input and
+ *       submits it.</li>
+ *   <li>The user can also type any URL in the address bar and press Enter or
+ *       click "Go" to navigate.</li>
+ * </ol>
+ *
+ * <h2>Communication edges logged</h2>
+ * Every directional interaction is logged via {@link AppLogger#comm} or
+ * {@link AppLogger#commTrace}:
+ * <ul>
+ *   <li>{@code User -> WebViewApp} — address bar / button clicks</li>
+ *   <li>{@code WebViewApp -> ProxiedWebView} — navigate calls</li>
+ *   <li>{@code WebViewApp -> Page JS} — address bar sync via location listener</li>
+ * </ul>
+ *
+ * <h2>No networking here</h2>
+ * This class never opens sockets, never starts a proxy, never handles SSE,
+ * and never touches the JS bridge directly. All of that lives in
+ * {@link ProxiedWebView}, {@link ProxyServer}, {@link JSBridge},
+ * {@link SSEHandler}, and {@link AutoHello}.
+ *
+ * @see ProxiedWebView
+ * @see AppConfig
+ * @see AppLogger
  */
 public class WebViewApp extends Application {
 
@@ -44,11 +67,23 @@ public class WebViewApp extends Application {
     private ProxiedWebView proxiedWebView;
     private TextField addressBar;
 
+    /**
+     * Application entry point. Logs startup and launches the JavaFX thread.
+     *
+     * @param args command-line arguments (unused by this application)
+     */
     public static void main(String[] args) {
         LOG.info("WebViewApp", "Starting application");
         launch(args);
     }
 
+    /**
+     * Builds the JavaFX stage and scene, creates {@link ProxiedWebView},
+     * wires up the address bar and navigation buttons, then navigates to
+     * the target origin.
+     *
+     * @param stage the primary JavaFX stage
+     */
     @Override
     public void start(Stage stage) {
         LOG.info("WebViewApp", "Initializing GUI");
@@ -128,13 +163,14 @@ public class WebViewApp extends Application {
         stage.setScene(scene);
         stage.show();
 
-        // Defer navigation so the WebView2 control (Windows) finishes initializing
+        // Defer navigation so the WebView control finishes initializing
         Platform.runLater(() -> {
             LOG.comm("WebViewApp", "ProxiedWebView", "INITIAL NAVIGATE", AppConfig.TARGET_ORIGIN);
             proxiedWebView.navigateTo(AppConfig.TARGET_ORIGIN);
         });
     }
 
+    /** Creates a toolbar button with label, tooltip, and action. */
     private static Button button(String label, String tooltip, Runnable action) {
         Button b = new Button(label);
         b.setTooltip(new Tooltip(tooltip));
@@ -142,6 +178,10 @@ public class WebViewApp extends Application {
         return b;
     }
 
+    /**
+     * Application shutdown hook. Stops {@link ProxiedWebView} (which stops the
+     * proxy server and all SSE streams).
+     */
     @Override
     public void stop() {
         LOG.info("WebViewApp", "Application shutting down");

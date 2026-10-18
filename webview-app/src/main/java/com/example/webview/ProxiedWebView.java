@@ -21,36 +21,74 @@ import java.util.function.Consumer;
  * A JavaFX {@link BorderPane} that wraps a {@link WebView} and interposes a
  * local {@link ProxyServer} between the page and the network.
  *
- * Since {@link WebView} is {@code final}, we use composition: this class owns
- * the WebView instance and exposes it via {@link #getWebView()}. All navigation
- * is rewritten to go through the proxy, which fixes up JavaFX WebView's
- * shortcomings with localhost servers (origin checks, User-Agent sniffing,
- * SSE streaming, etc.).
+ * <h2>Why this class exists</h2>
+ * JavaFX {@link WebView} is declared {@code final}, so it cannot be extended.
+ * We use composition instead: this class owns a {@code WebView} instance and
+ * exposes it via {@link #getWebView()}. Every page load is routed through a
+ * local HTTP proxy ({@link ProxyServer}) to work around JavaFX WebView's
+ * shortcomings with localhost servers:
+ * <ul>
+ *   <li>Origin checks — JavaFX sends the wrong Origin header to localhost</li>
+ *   <li>User-Agent sniffing — pi-web rejects non-browser user agents</li>
+ *   <li>SSE streaming — JavaFX does not expose native {@code EventSource}</li>
+ *   <li>Chunked transfer encoding — JavaFX does not handle it reliably</li>
+ * </ul>
  *
- * Responsibilities:
- *   - Own the WebView instance (center of this BorderPane)
- *   - Create and lifecycle-manage a ProxyServer
- *   - Rewrite target URLs to proxy URLs on navigate()
- *   - Install the JSBridge (console capture, postMessage, error capture)
- *   - Install the EventSource polyfill for SSE streaming
- *   - Route JS->Java messages (via JSBridge callback) to the SSEHandler
- *   - Log all communication between entities
+ * <h2>Architecture diagram</h2>
+ * <pre>
+ *   WebViewApp ──owns──> ProxiedWebView ──owns──> ProxyServer
+ *                                  │              (HTTP proxy, header rewrite, chunked encoding)
+ *                                  ├─owns──> SSEHandler  (SSE stream lifecycle, bounded pool)
+ *                                  ├─owns──> AutoHello   (dev-only, removable)
+ *                                  └─uses──> JSBridge    (window.javaBridge)
+ *                                        ↑
+ *                              Page JS calls postMessage()
+ * </pre>
  *
- * Relationships:
- *   ProxiedWebView HAS-A WebView
- *   ProxiedWebView HAS-A ProxyServer
- *   ProxiedWebView HAS-A JSBridge
- *   ProxiedWebView HAS-A SSEHandler
- *   WebViewApp HAS-A ProxiedWebView
+ * <h2>Responsibilities</h2>
+ * <ul>
+ *   <li>Own the {@link WebView} instance (center of this {@link BorderPane})</li>
+ *   <li>Create and lifecycle-manage a {@link ProxyServer}</li>
+ *   <li>Rewrite target URLs to proxy URLs on {@link #navigateTo(String)}</li>
+ *   <li>Install the {@link JSBridge} (console capture, postMessage, error capture)</li>
+ *   <li>Install the EventSource polyfill for SSE streaming</li>
+ *   <li>Route JS-&gt;Java messages (via JSBridge callback) to the {@link SSEHandler}</li>
+ *   <li>Log all communication between entities via {@link AppLogger}</li>
+ * </ul>
  *
- * Usage:
- *   ProxiedWebView view = new ProxiedWebView(targetOrigin, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout, maxRequestBodySize);
+ * <h2>Critical design decision: strong JSBridge reference</h2>
+ * JavaFX WebKit stores objects passed to {@code JSObject.setMember()} via
+ * <b>weak references</b>. Without a strong reference held on the Java side,
+ * the {@link JSBridge} is garbage-collected shortly after installation, and
+ * every later {@code javaBridge.*} call from JavaScript fails silently (all
+ * call sites in {@code bridge.js} and {@code autoHello.js} swallow exceptions
+ * in try/catch blocks). This was the primary root cause of the "Hello message
+ * never gets a reply" bug — once the bridge was GC'd, the EventSource polyfill
+ * could no longer open SSE streams, so no replies ever reached the page.
+ *
+ * We fixed this by holding a {@link CopyOnWriteArrayList} of installed
+ * {@link JSBridge} objects ({@link #installedBridges}), keeping them alive
+ * for the lifetime of the {@link ProxiedWebView}.
+ *
+ * <h2>Usage</h2>
+ * <pre>
+ *   ProxiedWebView view = new ProxiedWebView(
+ *       targetOrigin, proxyHost, bufferSize, userAgent,
+ *       connectTimeout, sseReadTimeout, maxRequestBodySize);
  *   view.start();
  *   view.navigateTo("http://127.0.0.1:30141");
  *   Stage stage = new Stage();
  *   stage.setScene(new Scene(view, 1100, 750));
  *   stage.show();
  *   view.stop();
+ * </pre>
+ *
+ * @see ProxyServer
+ * @see JSBridge
+ * @see SSEHandler
+ * @see AutoHello
+ * @see AppConfig
+ * @see AppLogger
  */
 public class ProxiedWebView extends BorderPane {
 
@@ -68,21 +106,26 @@ public class ProxiedWebView extends BorderPane {
 
     private String currentUrl;
 
-    /** Callback invoked when the page sends a message via javaBridge.postMessage(). */
+    /**
+     * Callback invoked when the page sends a message via
+     * {@code javaBridge.postMessage(msg)}. Non-SSE messages only;
+     * {@code __PI_SSE_START__} / {@code __PI_SSE_STOP__} are handled
+     * internally by {@link #installJSBridge()}.
+     */
     private Consumer<String> messageCallback;
 
-    /** Callback invoked when the page finishes loading. */
+    /**
+     * Callback invoked when the page finishes loading.
+     */
     private Runnable onPageLoaded;
 
     /**
-     * Strong references to installed JSBridge objects.
+     * Strong references to installed {@link JSBridge} objects.
      *
      * JavaFX WebKit stores objects passed to {@code setMember()} via WEAK
      * references. Without a strong reference held on the Java side, the bridge
      * is garbage-collected shortly after installation and every later
-     * {@code javaBridge.*} call from JS fails silently (all call sites in
-     * bridge.js / autoHello.js swallow exceptions), which kills console
-     * capture, the EventSource polyfill, and therefore all SSE replies.
+     * {@code javaBridge.*} call from JS fails silently.
      */
     private final List<JSBridge> installedBridges = new CopyOnWriteArrayList<>();
 
@@ -90,7 +133,15 @@ public class ProxiedWebView extends BorderPane {
     private volatile SSEHandler sseHandler;
 
     /**
-     * Create a proxied WebView with the given configuration.
+     * Creates a proxied WebView with the given configuration.
+     *
+     * @param targetOrigin       target origin (e.g. {@code http://127.0.0.1:30141})
+     * @param proxyHost          proxy bind host (e.g. {@code 127.0.0.1})
+     * @param bufferSize         streaming buffer size (bytes)
+     * @param userAgent          User-Agent string for proxy and SSE client
+     * @param connectTimeout     connection timeout (ms)
+     * @param sseReadTimeout     SSE stream read timeout (ms)
+     * @param maxRequestBodySize max request body size (bytes)
      */
     @SuppressWarnings("this-escape")
     public ProxiedWebView(
@@ -165,15 +216,21 @@ public class ProxiedWebView extends BorderPane {
     }
 
     /**
-     * Set a callback to run when the page finishes loading.
+     * Sets a callback to run when the page finishes loading.
+     *
+     * @param callback the callback to run on successful page load
      */
     public void setOnPageLoaded(Runnable callback) {
         this.onPageLoaded = callback;
     }
 
     /**
-     * Set a callback to receive messages posted from the page via {@code javaBridge.postMessage(msg)}.
-     * Non-SSE messages only; __PI_SSE_START__/__PI_SSE_STOP__ are handled internally.
+     * Sets a callback to receive messages posted from the page via
+     * {@code javaBridge.postMessage(msg)}. Non-SSE messages only;
+     * {@code __PI_SSE_START__} / {@code __PI_SSE_STOP__} are handled
+     * internally.
+     *
+     * @param callback the message callback, or {@code null} to clear it
      */
     public void setMessageCallback(Consumer<String> callback) {
         this.messageCallback = callback;
@@ -181,10 +238,13 @@ public class ProxiedWebView extends BorderPane {
     }
 
     /**
-     * Send a message string into the page's JavaScript context by invoking
+     * Sends a message string into the page's JavaScript context by invoking
      * {@code window.receiveMessageFromJava(msg)} if that function exists.
      *
-     * The message is escaped for safe embedding in a JavaScript string literal.
+     * The message is escaped for safe embedding in a JavaScript string literal
+     * (backslashes, quotes, newlines, control characters, and {@code </}).
+     *
+     * @param message the message to send to the page
      */
     public void sendToPage(String message) {
         String escaped = message
@@ -202,22 +262,27 @@ public class ProxiedWebView extends BorderPane {
         webView.getEngine().executeScript(script);
     }
 
-    /** Return the underlying JavaFX WebView. */
+    /** Returns the underlying JavaFX {@link WebView}. */
     public WebView getWebView() {
         return webView;
     }
 
-    /** Return the local port the proxy is listening on. */
+    /** Returns the local port the proxy is listening on. */
     public int getProxyListenPort() {
         return proxy.getListenPort();
     }
 
-    /** Return the underlying proxy server (useful for testing or advanced config). */
+    /** Returns the underlying proxy server (useful for testing or advanced config). */
     public ProxyServer getProxy() {
         return proxy;
     }
 
-    /** Get or create the SSEHandler (lazy initialization). */
+    /**
+     * Gets or creates the {@link SSEHandler} (lazy initialization to avoid
+     * 'this' escape in the constructor).
+     *
+     * @return the SSE handler instance
+     */
     private SSEHandler getSseHandler() {
         if (sseHandler == null) {
             synchronized (this) {
@@ -229,7 +294,11 @@ public class ProxiedWebView extends BorderPane {
         return sseHandler;
     }
 
-    /** Start the proxy server. Must be called before {@link #navigateTo(String)}. */
+    /**
+     * Starts the proxy server. Must be called before {@link #navigateTo(String)}.
+     *
+     * @throws RuntimeException if the proxy fails to start
+     */
     public void start() {
         try {
             proxy.start();
@@ -240,7 +309,10 @@ public class ProxiedWebView extends BorderPane {
         }
     }
 
-    /** Stop the proxy server and all SSE streams. Call this when the application exits. */
+    /**
+     * Stops the proxy server and all SSE streams. Call this when the
+     * application exits.
+     */
     public void stop() {
         LOG.info("ProxiedWebView", "Stopping...");
         getSseHandler().stopAll();
@@ -248,7 +320,13 @@ public class ProxiedWebView extends BorderPane {
         LOG.info("ProxiedWebView", "Stopped");
     }
 
-    /** Navigate to the given URL through the proxy. */
+    /**
+     * Navigates to the given URL through the proxy. The URL is normalized
+     * (scheme added if missing), rewritten to the local proxy port, and
+     * loaded by the WebView engine.
+     *
+     * @param rawUrl the URL to navigate to (e.g. {@code 127.0.0.1:30141})
+     */
     public void navigateTo(String rawUrl) {
         String url = normalizeUrl(rawUrl);
         if (url == null) {
@@ -266,7 +344,12 @@ public class ProxiedWebView extends BorderPane {
         webView.getEngine().load(proxyUrl);
     }
 
-    /** Extract target origin (scheme://host:port) from a full URL. */
+    /**
+     * Extracts the target origin (scheme://host:port) from a full URL.
+     *
+     * @param url the full URL
+     * @return the origin string, or the current proxy target origin on failure
+     */
     private String extractTargetOrigin(String url) {
         try {
             URI uri = new URI(url);
@@ -283,7 +366,10 @@ public class ProxiedWebView extends BorderPane {
         }
     }
 
-    /** Recreate proxy server with new target origin. */
+    /**
+     * Recreates the proxy server with a new target origin. Called when the
+     * user navigates to a different origin than the one currently proxied.
+     */
     private void recreateProxy(String newTargetOrigin) {
         // Stop existing proxy
         proxy.stop();
@@ -301,7 +387,13 @@ public class ProxiedWebView extends BorderPane {
         this.sseHandler = null; // will be lazily recreated via getSseHandler()
     }
 
-    /** Rewrite a target URL so it goes through the local proxy. */
+    /**
+     * Rewrites a target URL so it goes through the local proxy. The proxy
+     * always speaks HTTP locally; the target scheme is preserved via headers.
+     *
+     * @param url the target URL
+     * @return the proxy URL
+     */
     private String rewriteThroughProxy(String url) {
         try {
             URI uri = new URI(url);
@@ -323,8 +415,11 @@ public class ProxiedWebView extends BorderPane {
     }
 
     /**
-     * Adds https:// when the input has no scheme; returns null for blank input.
-     * Defaults to HTTPS for security, but preserves user-specified scheme.
+     * Normalizes a user-supplied URL. Adds {@code https://} when no scheme is
+     * present; returns {@code null} for blank input.
+     *
+     * @param raw the raw user input
+     * @return the normalized URL, or {@code null} if blank
      */
     private static String normalizeUrl(String raw) {
         if (raw == null) {
@@ -358,11 +453,18 @@ public class ProxiedWebView extends BorderPane {
     // ========================================================================
 
     /**
-     * Set up the JS bridge and EventSource polyfill.
+     * Sets up the JS bridge and EventSource polyfill.
      *
      * Runs on every successful page load: a new document gets a fresh window
-     * object, so setMember() must be re-executed (bridge.js itself is guarded
-     * per-document by window.__piBridgeInstalled).
+     * object, so {@code setMember()} must be re-executed (bridge.js itself is
+     * guarded per-document by {@code window.__piBridgeInstalled}).
+     *
+     * The bridge routes messages as follows:
+     * <ul>
+     *   <li>{@code __PI_SSE_START__:url} — forwarded to {@link SSEHandler#start(String)}</li>
+     *   <li>{@code __PI_SSE_STOP__:url} — forwarded to {@link SSEHandler#stop(String)}</li>
+     *   <li>everything else — forwarded to the external {@link #messageCallback}</li>
+     * </ul>
      */
     private void installJSBridge() {
         try {
@@ -416,14 +518,19 @@ public class ProxiedWebView extends BorderPane {
         }
     }
 
-    /** Read a text resource from the classpath using ResourceUtil. */
+    /**
+     * Reads a text resource from the classpath using {@link ResourceUtil}.
+     *
+     * @param name resource name (e.g. {@code bridge.js})
+     * @return resource content as UTF-8 string, or {@code null} if not found
+     */
     private static String readResource(String name) {
         return ResourceUtil.readResource(name, ProxiedWebView.class);
     }
 
     /**
-     * Execute arbitrary JavaScript after the page has loaded.
-     * Useful for injecting extensions.
+     * Executes arbitrary JavaScript after the page has loaded. Useful for
+     * injecting extensions such as AutoHello.
      *
      * @param script JavaScript code to execute
      */

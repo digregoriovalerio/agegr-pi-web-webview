@@ -1,4 +1,33 @@
 (function autoHello() {
+  // ===========================================================================
+  // autoHello.js — Dev-only: auto-types "Hello" and submits on page load
+  // ===========================================================================
+  //
+  // PURPOSE:
+  //   Smoke-tests the end-to-end Hello → reply flow without manual user
+  //   interaction. On page load it:
+  //     1. Finds the chat input (tries multiple selectors in order)
+  //     2. Sets its value to "Hello" (React-compatible setter + input event)
+  //     3. Dispatches Enter keydown/keypress/keyup to submit
+  //     4. Verifies the textarea was cleared (indicating successful submit)
+  //
+  // LIFECYCLE:
+  //   Guarded by window.__piAutoHelloDone — runs once per page load.
+  //   Retries finding the input up to 30 times at 500ms intervals to allow
+  //   React hydration time.
+  //
+  // PRODUCTION:
+  //   Set AppConfig.AUTOHELLO_ENABLED = false to remove AutoHello entirely.
+  //   Not needed for manual use — the user types and submits through the
+  //   page's own UI.
+  //
+  // LOGGING:
+  //   All actions are logged via javaBridge.log("[autoHello] ..."). If the
+  //   JSBridge has been garbage-collected (see ProxiedWebView), these logs
+  //   are silently swallowed — which is why the original "no reply" bug was
+  //   so hard to diagnose.
+  // ===========================================================================
+
   if (window.__piAutoHelloDone) return;
   window.__piAutoHelloDone = true;
   if (window.javaBridge) javaBridge.log("[autoHello] IIFE started");
@@ -23,8 +52,9 @@
     try { if (window.javaBridge) javaBridge.log("[autoHello] " + msg); } catch(e) {}
   }
 
+  // Sets an input value using React-compatible native setter, then dispatches
+  // an input event so React's controlled component picks up the change.
   function setInputValue(elem, newValue) {
-    // React-compatible: use the native value setter, then dispatch an input event
     var valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') ||
                       Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'value');
     if (valueSetter && valueSetter.set) {
@@ -36,7 +66,6 @@
     } else {
       elem.value = newValue;
     }
-
     try {
       var event = new Event('input', { bubbles: true });
       Object.defineProperty(event, 'target', {
@@ -50,8 +79,9 @@
     }
   }
 
+  // Dispatches Enter keydown/keypress/keyup — React onKeyDown handlers listen
+  // for keydown.
   function dispatchEnter(elem) {
-    // Enter keydown + keypress + keyup — React onKeyDown handlers listen for keydown
     var opts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
     elem.dispatchEvent(new KeyboardEvent('keydown', opts));
     elem.dispatchEvent(new KeyboardEvent('keypress', opts));
@@ -59,8 +89,8 @@
     log("[dispatchEnter] Enter keydown/keypress/keyup dispatched");
   }
 
+  // Falls back to form submission or send-button click if Enter doesn't work.
   function submitViaForm(input) {
-    // Only fall back to a form/submit-button INSIDE the chat form container
     var form = input.closest('form');
     if (form) {
       log("[submitViaForm] submitting chat form");
@@ -78,6 +108,7 @@
     }
   }
 
+  // Main retry loop: find input, type "Hello", dispatch Enter, verify submit.
   function trySendHello(attempt) {
     if (attempt === undefined) attempt = 0;
     if (attempt > 30) {
@@ -85,7 +116,6 @@
       return;
     }
 
-    // Try multiple selectors in order of specificity
     var input = document.querySelector('textarea.chat-input-textarea');
     if (!input) input = document.querySelector('textarea[placeholder*="message" i], textarea[placeholder*="chat" i]');
     if (!input) input = document.querySelector('textarea');
@@ -106,7 +136,6 @@
 
     setTimeoutTracked(function() {
       dispatchEnter(input);
-      // Verify send: React clears the textarea after a successful submit
       setTimeoutTracked(function() {
         if (input.value === '') {
           log("[trySendHello] textarea cleared — Hello submitted");

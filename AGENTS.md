@@ -18,12 +18,12 @@ Tools: JDK (`./jdk`), Maven (`./maven`), PowerShell, Windows.
 ./run.ps1
 ```
 
-Defaults: `-LogLevel DEBUG` (shows all inter-component communication).
+Defaults: `-LogLevel WARN` (shows all inter-component communication).
 
-Reduce noise:
+Increase verbosity:
 
 ```powershell
-./run.ps1 -LogLevel INFO   # or WARN, ERROR, TRACE
+./run.ps1 -LogLevel TRACE   # or DEBUG, INFO
 ```
 
 Skip build (faster iteration):
@@ -34,7 +34,7 @@ Skip build (faster iteration):
 
 Always shut down before relaunching.
 
-> AutoHello is enabled by default in `AppConfig.java`. To disable, change `AUTOHELLO_ENABLED = false`.
+> AutoHello is disabled by default in `AppConfig.java`. To enable, change `AUTOHELLO_ENABLED = true`.
 
 ## Architecture (concise)
 
@@ -133,7 +133,7 @@ SSEHandler -> Page JS      (sendToPage → receiveMessageFromJava)
 Page JS -> AutoHello       (DOM interaction)
 ```
 
-Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)` or via `-Dpi.log.level=DEBUG`.
+Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 
 ## Configuration (hardcoded in `AppConfig.java`)
 
@@ -147,9 +147,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)` or vi
 | `CONNECT_TIMEOUT` | `10000` | Connection timeout (ms) |
 | `MAX_REQUEST_BODY_SIZE` | `10485760` | Max request body size (bytes, 10MB) |
 | `AUTOHELLO_ENABLED` | `true` | Auto-type "Hello" on page load |
-| `LOG_LEVEL` | `TRACE` | Default log level (overridden by `-Dpi.log.level` or run.ps1) |
-
-Only runtime override: `-Dpi.log.level` (or `-LogLevel` in run.ps1).
+| `LOG_LEVEL` | `TRACE` | Default log level |
 
 ## Fixes for missing Hello reply (this session)
 
