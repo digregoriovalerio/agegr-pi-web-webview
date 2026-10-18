@@ -1,14 +1,9 @@
 package com.example.webview;
 
-import com.sun.net.httpserver.HttpExchange;
-import com.sun.net.httpserver.HttpHandler;
-import com.sun.net.httpserver.HttpServer;
-
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
-import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URL;
@@ -22,26 +17,28 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * A standalone HTTP proxy built on a raw {@link ServerSocket}.
  *
- * This works around JavaFX WebView's inability to connect to certain localhost
- * servers (e.g. pi-web on 127.0.0.1:30141). The proxy rewrites Origin/Referer
- * headers to the target origin and injects a browser-like User-Agent so that
- * server-side origin checks and browser sniffing pass.
+ * This is used to work around JavaFX WebView's inability to connect to
+ * certain localhost servers (e.g. pi-web on 127.0.0.1:30141). The proxy
+ * rewrites Origin/Referer headers to the target origin and injects a
+ * browser-like User-Agent so that server-side origin checks and browser
+ * sniffing pass.
  *
- * Streaming responses (text/event-stream / SSE) are piped incrementally so
- * LLM token streams reach the WebView as they arrive. All other responses are
- * buffered with Content-Length so keep-alive connections don't hang.
+ * Streaming responses (SSE/event-stream) are piped incrementally so LLM
+ * token streams reach the WebView as they arrive — no buffering, so
+ * event-stream connections don't time out.
  *
  * Usage:
- *   ProxyServer proxy = new ProxyServer("127.0.0.1", 30141, 0);
+ *   ProxyServer proxy = new ProxyServer("127.0.0.1", 30141, 0); // port 0 = random
  *   proxy.start();
  *   int port = proxy.getListenPort();
+ *   // Connect WebView to http://127.0.0.1:port instead of target directly
  *   proxy.stop();
  */
 public class ProxyServer {
 
-    private String targetHost;
-    private int targetPort;
-    private String targetOrigin;
+    private final String targetHost;
+    private final int targetPort;
+    private final String targetOrigin;
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "proxy-" + System.identityHashCode(r));
@@ -53,6 +50,13 @@ public class ProxyServer {
     private int listenPort;
     private volatile boolean running = false;
 
+    /**
+     * Create a proxy that forwards to the given target.
+     *
+     * @param targetHost target host (e.g. "127.0.0.1")
+     * @param targetPort target port (e.g. 30141)
+     * @param listenPort local port to bind (0 = random available port)
+     */
     public ProxyServer(String targetHost, int targetPort, int listenPort) {
         this.targetHost = targetHost;
         this.targetPort = targetPort;
@@ -60,13 +64,7 @@ public class ProxyServer {
         this.targetOrigin = "http://" + targetHost + ":" + targetPort;
     }
 
-    /** Update the target host:port for subsequent requests. */
-    public synchronized void setTarget(String host, int port) {
-        this.targetHost = host;
-        this.targetPort = port;
-        this.targetOrigin = "http://" + host + ":" + port;
-    }
-
+    /** Start the proxy server. */
     public void start() throws IOException {
         serverSocket = new ServerSocket(listenPort);
         serverSocket.setReuseAddress(true);
@@ -79,6 +77,7 @@ public class ProxyServer {
         while (running) {
             try {
                 Socket clientSocket = serverSocket.accept();
+                System.out.println("[proxy] accepted connection from " + clientSocket.getInetAddress());
                 executor.execute(() -> handleClient(clientSocket));
             } catch (IOException e) {
                 if (running) {
@@ -91,22 +90,28 @@ public class ProxyServer {
     private void handleClient(Socket clientSocket) {
         String method = "UNKNOWN";
         String path = "/";
+        System.out.println("[proxy] handleClient started");
         try (clientSocket) {
             clientSocket.setSoTimeout(300000);
             InputStream clientIn = clientSocket.getInputStream();
             OutputStream clientOut = clientSocket.getOutputStream();
 
+            // Read the HTTP request
             byte[] reqBuf = readRequest(clientIn);
             String reqStr = new String(reqBuf, "UTF-8");
 
+            // Parse request line
             String[] firstLine = reqStr.split("\r?\n", 2)[0].split(" ", 3);
             method = firstLine[0];
             path = firstLine[1];
 
+            // Build target URL
             String targetUrl = targetOrigin + path;
 
+            // Parse headers
             Map<String, String> headers = parseHeaders(reqStr);
 
+            // Read body if present
             byte[] body = new byte[0];
             String contentLengthStr = headers.get("content-length");
             if (contentLengthStr != null) {
@@ -122,6 +127,7 @@ public class ProxyServer {
                 }
             }
 
+            // Forward to target
             URL url = new URL(targetUrl);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod(method);
@@ -140,6 +146,7 @@ public class ProxyServer {
                 }
             }
 
+            // Forward headers
             boolean forwardedUa = false;
             boolean forwardedOrigin = false;
             boolean forwardedReferer = false;
@@ -174,10 +181,12 @@ public class ProxyServer {
 
             conn.connect();
             int statusCode = conn.getResponseCode();
+            System.out.printf("[proxy] %s %s -> %d%n", method, path, statusCode);
+            System.out.printf("[proxy]   request headers: %s%n", headers);
 
+            // Read response headers
             StringBuilder respHeaders = new StringBuilder();
-            respHeaders.append("HTTP/1.1 ").append(statusCode).append(" ")
-                .append(conn.getResponseMessage()).append("\r\n");
+            respHeaders.append("HTTP/1.1 ").append(statusCode).append(" ").append(conn.getResponseMessage()).append("\r\n");
             for (int i = 0; ; i++) {
                 String name = conn.getHeaderFieldKey(i);
                 String value = conn.getHeaderField(i);
@@ -188,6 +197,7 @@ public class ProxyServer {
                 }
             }
 
+            // Get input stream
             InputStream targetIn;
             try {
                 targetIn = conn.getInputStream();
@@ -201,29 +211,34 @@ public class ProxyServer {
                 }
             }
 
+            // Check if streaming (SSE/event-stream or chunked transfer encoding)
             String contentType = conn.getHeaderField("Content-Type");
-            boolean streaming = contentType != null &&
-                contentType.contains("text/event-stream");
+            String transferEncoding = conn.getHeaderField("Transfer-Encoding");
+            String contentLength = conn.getHeaderField("Content-Length");
+            boolean streaming = contentType != null && contentType.contains("text/event-stream")
+                || transferEncoding != null && transferEncoding.contains("chunked");
+
+            System.out.printf("[proxy] %s %s response: ct=%s te=%s cl=%s streaming=%b%n",
+                method, path, contentType, transferEncoding, contentLength, streaming);
 
             if (streaming) {
+                // Stream incrementally: headers + blank line, then body
                 respHeaders.append("\r\n");
                 clientOut.write(respHeaders.toString().getBytes("UTF-8"));
                 clientOut.flush();
-                System.out.printf("[proxy] %s %s -> %d (SSE streaming)%n",
-                    method, path, statusCode);
+                System.out.printf("[proxy] %s %s sent headers, streaming body...%n", method, path);
                 pipe(targetIn, clientOut);
             } else {
+                // Buffer response (read with socket timeout)
                 byte[] respBody = targetIn.readAllBytes();
-                respHeaders.append("Content-Length: ").append(respBody.length)
-                    .append("\r\n\r\n");
+                respHeaders.append("Content-Length: ").append(respBody.length).append("\r\n\r\n");
                 clientOut.write(respHeaders.toString().getBytes("UTF-8"));
                 clientOut.write(respBody);
                 clientOut.flush();
                 System.out.printf("[proxy] %s %s -> %d%n", method, path, statusCode);
             }
         } catch (Exception e) {
-            System.err.printf("[proxy] %s %s -> error: %s%n", method, path,
-                e.getMessage());
+            System.err.printf("[proxy] %s %s -> error: %s%n", method, path, e.getMessage());
         }
     }
 
@@ -243,6 +258,7 @@ public class ProxyServer {
             int read = in.read(buf, total, buf.length - total);
             if (read < 0) break;
             total += read;
+            // Check if we have the full header + body
             if (total >= 4) {
                 String partial = new String(buf, 0, total, "UTF-8");
                 int headerEnd = partial.indexOf("\r\n\r\n");
@@ -265,11 +281,13 @@ public class ProxyServer {
                             return full;
                         }
                     } else {
+                        // No content-length, request is complete
                         byte[] full = new byte[total];
                         System.arraycopy(buf, 0, full, 0, total);
                         return full;
                     }
                 }
+                // Buffer full, need to expand
                 if (total == buf.length) {
                     byte[] newBuf = new byte[buf.length * 2];
                     System.arraycopy(buf, 0, newBuf, 0, buf.length);
@@ -311,10 +329,12 @@ public class ProxyServer {
     private static boolean isRestrictedResponseHeader(String name) {
         String lower = name.toLowerCase();
         return Set.of(
-            "connection", "transfer-encoding", "content-length"
+            "connection", "transfer-encoding", "content-length",
+            "content-security-policy", "content-security-policy-report-only"
         ).contains(lower);
     }
 
+    /** Stop the proxy server. */
     public void stop() {
         running = false;
         try {
@@ -326,10 +346,12 @@ public class ProxyServer {
         executor.shutdownNow();
     }
 
+    /** Returns the local port the proxy is listening on. */
     public int getListenPort() {
         return listenPort;
     }
 
+    /** Returns the full target origin URL (e.g. "http://127.0.0.1:30141"). */
     public String getTargetOrigin() {
         return targetOrigin;
     }
