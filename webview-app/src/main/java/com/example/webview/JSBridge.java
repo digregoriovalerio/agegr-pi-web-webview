@@ -19,6 +19,9 @@ public class JSBridge {
 
     private static final AppLogger LOG = AppLogger.INSTANCE;
 
+    private static final String SSE_START_PREFIX = "__PI_SSE_START__:";
+    private static final String SSE_STOP_PREFIX = "__PI_SSE_STOP__:";
+
     private final Consumer<String> messageCallback;
 
     public JSBridge(Consumer<String> messageCallback) {
@@ -42,9 +45,21 @@ public class JSBridge {
      * and any custom page-to-Java messaging.
      */
     public void postMessage(String msg) {
-        LOG.comm("Page JS", "JSBridge", "POST_MESSAGE", msg);
+        // Filter internal SSE protocol messages from DEBUG comm logging
+        // They are logged at TRACE level instead
+        boolean isSseProtocol = msg.startsWith(SSE_START_PREFIX) || msg.startsWith(SSE_STOP_PREFIX);
+        if (isSseProtocol) {
+            LOG.commTrace("Page JS", "JSBridge", "POST_MESSAGE", msg);
+        } else {
+            LOG.comm("Page JS", "JSBridge", "POST_MESSAGE", msg);
+        }
+
         if (messageCallback != null) {
-            LOG.comm("JSBridge", "ProxiedWebView", "CALLBACK", msg);
+            if (isSseProtocol) {
+                LOG.commTrace("JSBridge", "ProxiedWebView", "CALLBACK", msg);
+            } else {
+                LOG.comm("JSBridge", "ProxiedWebView", "CALLBACK", msg);
+            }
             messageCallback.accept(msg);
         }
     }

@@ -6,11 +6,17 @@ import javafx.application.Platform;
 
 import java.io.InputStream;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SSEHandler manages Server-Sent Events (SSE) streaming between the target server
@@ -22,35 +28,67 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   Target SSE endpoint --events--> SSEHandler --sendToPage--> ProxiedWebView --executeScript--> Page JS (receiveMessageFromJava)
  *   Page JS (EventSource.close) --__PI_SSE_STOP__:url--> JSBridge --postMessage--> ProxiedWebView --callback--> SSEHandler.stop(url)
  *
- * All configuration (User-Agent, buffer size, timeouts, proxy host) comes from
- * {@link AppConfig}, which can be overridden via system properties.
+ * All configuration is passed via individual constructor parameters.
  */
 public class SSEHandler {
 
     private static final AppLogger LOG = AppLogger.INSTANCE;
 
     private final ProxiedWebView proxiedWebView;
+    private final int bufferSize;
+    private final String userAgent;
+    private final int connectTimeout;
+    private final int sseReadTimeout;
+
+    /** Executor for SSE reader threads (bounded pool). */
+    private final ExecutorService executor = Executors.newFixedThreadPool(
+        4,
+        new ThreadFactory() {
+            private final AtomicInteger counter = new AtomicInteger(0);
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "sse-reader-" + counter.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            }
+        }
+    );
+
+    /** Per-stream state including running flag and leftover buffer. */
+    private static class StreamState {
+        final AtomicBoolean running = new AtomicBoolean(true);
+        final StringBuilder leftover = new StringBuilder();
+    }
 
     // Tracks active SSE streams opened by the EventSource polyfill in the page.
-    private final Map<String, AtomicBoolean> sseStreams = new ConcurrentHashMap<>();
-
-    /** Buffer size for reading SSE stream chunks. */
-    private final int bufferSize;
-
-    /** Proxy host used for Origin/Referer headers. */
-    private final String proxyHost;
+    // Value is a StreamState containing the running flag and leftover buffer.
+    private final Map<String, StreamState> sseStreams = new ConcurrentHashMap<>();
 
     /**
      * Create an SSE handler attached to a ProxiedWebView.
      *
      * @param proxiedWebView the view used to send events back to the page
+     * @param proxyHost proxy host for Origin/Referer headers
+     * @param bufferSize streaming buffer size
+     * @param userAgent User-Agent for SSE requests
+     * @param connectTimeout connection timeout (ms)
+     * @param sseReadTimeout SSE read timeout (ms)
      */
-    public SSEHandler(ProxiedWebView proxiedWebView) {
+    public SSEHandler(
+        ProxiedWebView proxiedWebView,
+        String proxyHost,
+        int bufferSize,
+        String userAgent,
+        int connectTimeout,
+        int sseReadTimeout
+    ) {
         this.proxiedWebView = proxiedWebView;
-        this.bufferSize = AppConfig.getBufferSize();
-        this.proxyHost = AppConfig.getProxyHost();
+        this.bufferSize = bufferSize;
+        this.userAgent = userAgent;
+        this.connectTimeout = connectTimeout;
+        this.sseReadTimeout = sseReadTimeout;
         LOG.info("SSEHandler", "Created and attached to ProxiedWebView"
-            + " (bufferSize=" + bufferSize + ", proxyHost=" + proxyHost + ")");
+            + " (bufferSize=" + bufferSize + ")");
     }
 
     /**
@@ -62,36 +100,43 @@ public class SSEHandler {
     public void start(String sseUrl) {
         LOG.info("SSEHandler", "START requested for " + sseUrl);
 
-        AtomicBoolean running = new AtomicBoolean(true);
-        AtomicBoolean previous = sseStreams.putIfAbsent(sseUrl, running);
+        StreamState state = new StreamState();
+        StreamState previous = sseStreams.putIfAbsent(sseUrl, state);
         if (previous != null) {
             LOG.warn("SSEHandler", "Stream already running for " + sseUrl + ", stopping old one first");
             stop(sseUrl);
-            sseStreams.put(sseUrl, running);
+            sseStreams.put(sseUrl, state);
         }
 
-        Thread readerThread = new Thread(() -> {
+        executor.execute(() -> {
             String fetchUrl = sseUrl;
+            // Page JS may pass relative URLs (e.g. "/api/agent/.../events");
+            // resolve them against the target origin.
+            if (!fetchUrl.matches("^[a-zA-Z][a-zA-Z0-9+.-]*://.*")) {
+                fetchUrl = proxiedWebView.getProxy().getTargetOrigin() + fetchUrl;
+                LOG.debug("SSEHandler", "Resolved relative SSE URL against target origin: " + fetchUrl);
+            }
             HttpURLConnection conn = null;
             InputStream in = null;
             try {
                 LOG.comm("SSEHandler", "Target(" + fetchUrl + ")", "SSE OPEN",
                     "Opening SSE stream");
 
-                URL url = new URL(fetchUrl);
+                URL url = URI.create(fetchUrl).toURL();
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("GET");
                 conn.setInstanceFollowRedirects(false);
-                conn.setConnectTimeout(AppConfig.DEFAULT_CONNECT_TIMEOUT);
-                conn.setReadTimeout(AppConfig.DEFAULT_SSE_READ_TIMEOUT);
+                conn.setConnectTimeout(connectTimeout);
+                conn.setReadTimeout(sseReadTimeout); // Idle timeout
                 conn.setUseCaches(false);
                 conn.setRequestProperty("Accept", "text/event-stream");
                 conn.setRequestProperty("Cache-Control", "no-cache");
                 conn.setRequestProperty("Connection", "keep-alive");
-                conn.setRequestProperty("User-Agent", AppConfig.getUserAgent());
-                int proxyPort = proxiedWebView.getProxyListenPort();
-                conn.setRequestProperty("Origin", "http://" + proxyHost + ":" + proxyPort);
-                conn.setRequestProperty("Referer", "http://" + proxyHost + ":" + proxyPort + "/");
+                conn.setRequestProperty("User-Agent", userAgent);
+                // Use target origin for CORS, not proxy
+                String targetOrigin = proxiedWebView.getProxy().getTargetOrigin();
+                conn.setRequestProperty("Origin", targetOrigin);
+                conn.setRequestProperty("Referer", targetOrigin + "/");
 
                 conn.connect();
                 int status = conn.getResponseCode();
@@ -111,22 +156,22 @@ public class SSEHandler {
 
                 byte[] buf = new byte[bufferSize];
                 int read;
-                StringBuilder leftover = new StringBuilder();
                 int totalBytes = 0;
 
-                while (running.get() && (read = in.read(buf)) != -1) {
+                while (state.running.get() && (read = in.read(buf)) != -1) {
                     totalBytes += read;
                     String chunk = new String(buf, 0, read, "UTF-8");
                     LOG.commTrace("Target(" + fetchUrl + ")", "SSEHandler", "SSE CHUNK",
                         read + " bytes (total: " + totalBytes + "): "
                         + chunk.substring(0, Math.min(200, chunk.length())).replace("\n", "\\n"));
 
-                    leftover.append(chunk);
-                    processSSEChunk(leftover, running);
+                    state.leftover.append(chunk);
+                    processSSEChunk(state);
                 }
 
-                if (leftover.length() > 0 && running.get()) {
-                    String remaining = leftover.toString().trim();
+                // Flush any remaining data on normal stream end
+                if (state.leftover.length() > 0 && state.running.get()) {
+                    String remaining = state.leftover.toString().trim();
                     if (!remaining.isEmpty()) {
                         LOG.comm("SSEHandler", "Page", "SSE FLUSH",
                             "Flushing remaining " + remaining.length() + " bytes");
@@ -136,30 +181,28 @@ public class SSEHandler {
 
                 LOG.info("SSEHandler", "Stream ended normally: " + fetchUrl + " (total bytes: " + totalBytes + ")");
             } catch (Exception e) {
-                if (running.get()) {
+                if (state.running.get()) {
                     LOG.error("SSEHandler", "Error reading " + fetchUrl + ": " + e.getMessage());
                 }
             } finally {
                 try { if (in != null) in.close(); } catch (Exception ignored) {}
                 try { if (conn != null) conn.disconnect(); } catch (Exception ignored) {}
-                sseStreams.remove(sseUrl, running);
+                sseStreams.remove(sseUrl, state);
                 LOG.info("SSEHandler", "Stream closed: " + fetchUrl);
             }
-        }, "sse-reader-" + System.identityHashCode(sseUrl));
-        readerThread.setDaemon(true);
-        readerThread.start();
+        });
     }
 
     /**
      * Process a chunk of SSE data, extracting and dispatching complete events.
      */
-    private void processSSEChunk(StringBuilder leftover, AtomicBoolean running) {
-        String data = leftover.toString();
+    private void processSSEChunk(StreamState state) {
+        String data = state.leftover.toString();
         int idx;
         while ((idx = data.indexOf("\n\n")) >= 0) {
             String eventBlock = data.substring(0, idx);
             data = data.substring(idx + 2);
-            if (running.get() && !eventBlock.isBlank()) {
+            if (state.running.get() && !eventBlock.isBlank()) {
                 String finalEvent = eventBlock.trim();
                 if (!finalEvent.isEmpty()) {
                     String eventWithTerminator = finalEvent + "\n\n";
@@ -169,8 +212,8 @@ public class SSEHandler {
                 }
             }
         }
-        leftover.setLength(0);
-        leftover.append(data);
+        state.leftover.setLength(0);
+        state.leftover.append(data);
     }
 
     /**
@@ -180,10 +223,19 @@ public class SSEHandler {
      */
     public void stop(String sseUrl) {
         LOG.info("SSEHandler", "STOP requested for " + sseUrl);
-        AtomicBoolean running = sseStreams.get(sseUrl);
-        if (running != null) {
-            running.set(false);
-            sseStreams.remove(sseUrl);
+        StreamState state = sseStreams.get(sseUrl);
+        if (state != null) {
+            state.running.set(false);
+            // Flush any remaining buffered data before removing
+            if (state.leftover.length() > 0) {
+                String remaining = state.leftover.toString().trim();
+                if (!remaining.isEmpty()) {
+                    LOG.comm("SSEHandler", "Page", "SSE FLUSH (on stop)",
+                        "Flushing remaining " + remaining.length() + " bytes");
+                    Platform.runLater(() -> proxiedWebView.sendToPage(remaining));
+                }
+            }
+            sseStreams.remove(sseUrl, state); // conditional remove to avoid race
             LOG.info("SSEHandler", "Stopping stream: " + sseUrl);
         } else {
             LOG.debug("SSEHandler", "No active stream for " + sseUrl);
@@ -193,10 +245,30 @@ public class SSEHandler {
     /** Stop all active SSE streams. Call on application shutdown. */
     public void stopAll() {
         LOG.info("SSEHandler", "Stopping all " + sseStreams.size() + " streams");
-        for (Map.Entry<String, AtomicBoolean> entry : sseStreams.entrySet()) {
-            entry.getValue().set(false);
+        for (Map.Entry<String, StreamState> entry : sseStreams.entrySet()) {
+            StreamState state = entry.getValue();
+            state.running.set(false);
+            // Flush any remaining buffered data
+            if (state.leftover.length() > 0) {
+                String remaining = state.leftover.toString().trim();
+                if (!remaining.isEmpty()) {
+                    LOG.comm("SSEHandler", "Page", "SSE FLUSH (on stopAll)",
+                        "Flushing remaining " + remaining.length() + " bytes for " + entry.getKey());
+                    Platform.runLater(() -> proxiedWebView.sendToPage(remaining));
+                }
+            }
             LOG.debug("SSEHandler", "Signalling stop for " + entry.getKey());
         }
         sseStreams.clear();
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                LOG.warn("SSEHandler", "Executor did not terminate gracefully, forcing shutdown");
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
+        }
     }
 }

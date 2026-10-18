@@ -1,8 +1,5 @@
 package com.example.webview.logging;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-
 /**
  * Centralized logging facade for the WebViewApp architecture.
  *
@@ -39,17 +36,16 @@ public enum AppLogger {
         public int value() { return ordinal; }
     }
 
-    /** Tracks whether each source has logged at least once (for dedup of startup banner). */
-    private final ConcurrentMap<String, Boolean> loggedSources = new ConcurrentHashMap<>();
+    /** Maximum length for comm/commTrace messages before truncation. */
+    private static final int MAX_COMM_LENGTH = 500;
 
     AppLogger() {
         this.currentLevel = readLevelFromSystemProperty();
         System.out.println("[AppLogger] Logging initialized at level=" + currentLevel);
     }
 
-    /** Read the initial log level from the {@code pi.log.level} system property. */
     private static Level readLevelFromSystemProperty() {
-        String prop = System.getProperty("pi.log.level", "INFO");
+        String prop = System.getProperty("pi.log.level", "DEBUG");
         try {
             return Level.valueOf(prop.toUpperCase());
         } catch (IllegalArgumentException e) {
@@ -77,7 +73,9 @@ public enum AppLogger {
     }
 
     private boolean enabled(Level level) {
-        return level.value() >= currentLevel.value();
+        // Lower ordinal = higher severity; a message passes if its severity
+        // is at least as high as the configured level.
+        return level.value() <= currentLevel.value();
     }
 
     private void emit(Level level, String source, String message) {
@@ -87,8 +85,13 @@ public enum AppLogger {
     }
 
     private static String padRight(String s, int width) {
-        if (s.length() >= width) return s;
-        return s + " ".repeat(width - s.length());
+        return String.format("%-" + width + "s", s);
+    }
+
+    /** Truncate message for comm/commTrace logging. */
+    private static String truncate(String message) {
+        if (message.length() <= MAX_COMM_LENGTH) return message;
+        return message.substring(0, MAX_COMM_LENGTH) + "... [" + (message.length() - MAX_COMM_LENGTH) + " chars truncated]";
     }
 
     /** Log at TRACE level. */
@@ -120,13 +123,13 @@ public enum AppLogger {
     public void comm(String from, String to, String direction, String message) {
         if (!enabled(Level.DEBUG)) return;
         String tag = "[" + from + " -> " + to + "]";
-        System.out.println("[DEBUG] " + padRight(tag, 32) + " [" + direction + "] " + message);
+        System.out.println("[DEBUG] " + padRight(tag, 32) + " [" + direction + "] " + truncate(message));
     }
 
     /** Log a directional communication at TRACE level. */
     public void commTrace(String from, String to, String direction, String message) {
         if (!enabled(Level.TRACE)) return;
         String tag = "[" + from + " -> " + to + "]";
-        System.out.println("[TRACE] " + padRight(tag, 32) + " [" + direction + "] " + message);
+        System.out.println("[TRACE] " + padRight(tag, 32) + " [" + direction + "] " + truncate(message));
     }
 }

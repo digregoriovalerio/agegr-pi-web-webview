@@ -18,7 +18,7 @@ Tools: JDK (`./jdk`), Maven (`./maven`), PowerShell, Windows.
 ./run.ps1
 ```
 
-Defaults: `-LogLevel DEBUG` (shows all inter-component communication), `-Dpi.autohello.enabled=true`.
+Defaults: `-LogLevel DEBUG` (shows all inter-component communication).
 
 Reduce noise:
 
@@ -26,7 +26,15 @@ Reduce noise:
 ./run.ps1 -LogLevel INFO   # or WARN, ERROR, TRACE
 ```
 
+Skip build (faster iteration):
+
+```powershell
+./run.ps1 -SkipBuild
+```
+
 Always shut down before relaunching.
+
+> AutoHello is enabled by default in `AppConfig.java`. To disable, change `AUTOHELLO_ENABLED = false`.
 
 ## Architecture (concise)
 
@@ -34,17 +42,22 @@ Always shut down before relaunching.
 |-----------|------|------|
 | **WebViewApp** | `WebViewApp.java` | GUI only: stage, scene, address bar, nav buttons. Owns ProxiedWebView. |
 | **ProxiedWebView** | `ProxiedWebView.java` | Wraps `WebView` (composition — `WebView` is `final`). Owns ProxyServer, SSEHandler, AutoHello. Interposes proxy between page and network. |
-| **ProxyServer** | `ProxyServer.java` | HTTP proxy: rewrites Origin/Referer, injects User-Agent, pipes SSE streams. |
+| **ProxyServer** | `ProxyServer.java` | HTTP proxy: rewrites Origin/Referer, injects User-Agent, pipes SSE streams. Handles chunked request bodies, validates paths for SSRF. |
 | **JSBridge** | `JSBridge.java` | `window.javaBridge`: captures `console.log`, `console.error`, `window.onerror`, `postMessage()`. |
-| **SSEHandler** | `SSEHandler.java` | SSE stream lifecycle: open → read → forward events back to page. |
+| **SSEHandler** | `SSEHandler.java` | SSE stream lifecycle: open → read → forward events back to page. Uses bounded thread pool. |
 | **AutoHello** | `AutoHello.java` | Dev-only: auto-types "Hello" and submits. Removable in production. |
-| **AppConfig** | `AppConfig.java` | Shared config: User-Agent, buffer size, proxy/target host/port, timeouts. |
-| **AppLogger** | `logging/AppLogger.java` | Level-based logging (TRACE/DEBUG/INFO/WARN/ERROR) to `System.out`. |
+| **AppConfig** | `AppConfig.java` | Shared config: User-Agent, buffer size, proxy/target host/port, timeouts, max body size. |
+| **AppLogger** | `logging/AppLogger.java` | Level-based logging (TRACE/DEBUG/INFO/WARN/ERROR) to `System.out` with message truncation. |
+| **ResourceUtil** | `ResourceUtil.java` | Classpath resource loading with context ClassLoader fallback. |
 
 ### JS resources (classpath)
 
 - `src/main/resources/bridge.js` — bridge install + EventSource polyfill + SSE state
 - `src/main/resources/autoHello.js` — auto "Hello" IIFE
+
+### Utility classes
+
+- `src/main/java/com/example/webview/ResourceUtil.java` — classpath resource loading with context ClassLoader fallback
 
 ## Detailed Architecture
 
@@ -52,8 +65,8 @@ Always shut down before relaunching.
 
 ```
 WebViewApp ──owns──> ProxiedWebView ──owns──> ProxyServer
-                              │              (HTTP proxy, header rewrite)
-                              ├─owns──> SSEHandler  (SSE stream lifecycle)
+                              │              (HTTP proxy, header rewrite, chunked encoding)
+                              ├─owns──> SSEHandler  (SSE stream lifecycle, bounded pool)
                               ├─owns──> AutoHello   (dev-only, removable)
                               └─uses──> JSBridge    (window.javaBridge)
                                     ↑
@@ -122,17 +135,32 @@ Page JS -> AutoHello       (DOM interaction)
 
 Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)` or via `-Dpi.log.level=DEBUG`.
 
-## Configuration (system properties)
+## Configuration (hardcoded in `AppConfig.java`)
 
-| Property | Default | Purpose |
-|----------|---------|---------|
-| `pi.log.level` | `INFO` | Log verbosity (TRACE/DEBUG/INFO/WARN/ERROR) |
-| `pi.autohello.enabled` | `true` | Disable in production: `-Dpi.autohello.enabled=false` |
-| `pi.user.agent` | browser-like UA | User-Agent for proxy and SSE client |
-| `pi.buffer.size` | `8192` | Streaming buffer size (bytes) |
-| `pi.proxy.host` | `127.0.0.1` | Proxy bind host |
-| `pi.target.host` | `127.0.0.1` | Target host |
-| `pi.target.port` | `30141` | Target port |
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `TARGET_ORIGIN` | `http://127.0.0.1:30141` | Target origin (scheme://host:port) |
+| `PROXY_HOST` | `127.0.0.1` | Proxy bind host |
+| `BUFFER_SIZE` | `8192` | Streaming buffer size (bytes) |
+| `USER_AGENT` | Chrome 130 UA string | User-Agent for proxy and SSE client |
+| `SSE_READ_TIMEOUT` | `300000` | SSE stream read timeout (ms) |
+| `CONNECT_TIMEOUT` | `10000` | Connection timeout (ms) |
+| `MAX_REQUEST_BODY_SIZE` | `10485760` | Max request body size (bytes, 10MB) |
+| `AUTOHELLO_ENABLED` | `true` | Auto-type "Hello" on page load |
+| `LOG_LEVEL` | `TRACE` | Default log level (overridden by `-Dpi.log.level` or run.ps1) |
+
+Only runtime override: `-Dpi.log.level` (or `-LogLevel` in run.ps1).
+
+## Fixes for missing Hello reply (this session)
+
+| Fix | File | Root Cause |
+|-----|------|------------|
+| JSBridge strong reference | `ProxiedWebView.java` | JavaFX `setMember()` uses weak references — `JSBridge` was GC'd after install, killing all later `javaBridge.*` calls from JS. Fixed by holding a `List<JSBridge>` strong reference. |
+| Proxy POST body double-read | `ProxyServer.java` | `readRequest()` already consumes the full body; `handleClient()` tried to read it again from `clientIn` → blocks until read timeout. Fixed by extracting body from already-read `reqBuf`. |
+| `getOutputStream()` + explicit `connect()` | `ProxyServer.java` | `getOutputStream()` implicitly connects; explicit `conn.connect()` afterward throws "Already connected". Fixed by removing all explicit `conn.connect()` calls. |
+| SSE relative URL resolution | `SSEHandler.java` | pi-web uses `new EventSource("/api/agent/${id}/events")` — relative URL. `URI.create(relative).toURL()` throws. Fixed by resolving against target origin. |
+| EventSource polyfill fallback | `bridge.js` | If `javaBridge.postMessage()` throws, polyfill silently failed. Fixed by catching failure and falling back to `NativeEventSource`. |
+| `-LogLevel` CLI parameter | `run.ps1` | Added `-LogLevel` parameter with `-Djavafx.run.jvmArguments=-Dpi.log.level=$LogLevel`. |
 
 ## Housekeeping (future maintenance)
 
@@ -151,18 +179,18 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)` or vi
 2. Do not hardcode `127.0.0.1`, `8192`, or User-Agent strings — use `AppConfig`
 3. Do not inline large JavaScript strings in Java — put them in `src/main/resources/*.js` and load via `readResource()`
 4. Keep `WebViewApp` GUI-only: no networking, proxy, SSE, or JS bridge logic there
-5. Keep `AutoHello` removable: always gate behind `autoHello.isEnabled()` and `-Dpi.autohello.enabled=false`
+5. Keep `AutoHello` removable
 
 ### Production housekeeping
 
-- Set `-Dpi.autohello.enabled=false` to remove AutoHello
-- Set `-Dpi.log.level=WARN` or `ERROR` to reduce log noise
-- Review `AppConfig.getUserAgent()` if the target server changes its browser sniffing
+- Set `AUTOHELLO_ENABLED = false` in `AppConfig.java` to remove AutoHello
+- Set `-LogLevel WARN` or `ERROR` to reduce log noise
+- Review `AppConfig.USER_AGENT` if the target server changes its browser sniffing
 - Ensure `ProxyServer` header rewrites (Origin/Referer) still match the target origin
 
 ### Verification checklist (run after every change)
 
-- [ ] `./run.ps1` starts without errors
+- [ ] `./run.ps1` starts without errors (MUST run via `./run.ps1` — NOT `mvn javafx:run` directly)
 - [ ] Logs appear at the configured level (`-LogLevel DEBUG` shows all inter-component comms)
 - [ ] AutoHello submits "Hello" on page load (unless disabled)
 - [ ] GUI shows the response to "Hello"
@@ -170,6 +198,14 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)` or vi
 - [ ] No hardcoded `127.0.0.1`, `8192`, or User-Agent literals outside `AppConfig`
 - [ ] No inline JS strings longer than one line in Java files
 - [ ] Have you sync-ed the AGENTS.md?
+
+> **IMPORTANT**: Always run the application via `./run.ps1`. This script:
+> - Sets up `JAVA_HOME` and `MAVEN_HOME` correctly
+> - Passes required JVM arguments (`-Dpi.log.level`, `-Dpi.autohello.enabled`, etc.)
+> - Runs pre-build compilation step
+> - Performs pi-web health check
+> - Restores working directory on exit
+> Running `mvn javafx:run` directly bypasses all of the above and will fail or behave incorrectly.
 
 ## AGENTS.md sync discipline
 
@@ -193,7 +229,18 @@ AGENTS.md must be updated with every modification to code, configuration, or arc
 | `run.ps1` must reset cwd on exit | Wrap `Push-Location`/`Pop-Location` in `try/finally` so the caller's cwd is restored | `run.ps1` |
 | AutoHello must be removable in production | Gate behind `pi.autohello.enabled` system property (default `true`) | `AutoHello.java`, `run.ps1` |
 | `AppConfig` centralizes all tunable values | User-Agent, buffer size, proxy/target host/port all in one place — no hardcoding | `AppConfig.java` |
+| Use single `targetOrigin` string instead of separate host/port/scheme | Simplifies ProxyServer constructor, reduces config surface, matches RFC 6454 origin format | `ProxyServer.java`, `AppConfig.java` |
 | SSE messages (`__PI_SSE_START__`/`__PI_SSE_STOP__`) routed internally | `ProxiedWebView` handles them via JSBridge callback — `WebViewApp` never sees them | `ProxiedWebView.java` |
+| Unbounded thread pools cause OOM | Use `Executors.newFixedThreadPool()` with bounded size for proxy and SSE handlers | `ProxyServer.java`, `SSEHandler.java` |
+| Chunked transfer encoding not handled by default | Must implement custom chunked request parsing in proxy | `ProxyServer.java` |
+| SSRF via absolute-form request URIs | Validate request path starts with `/` and reject scheme://host paths | `ProxyServer.java` |
+| Lambda in constructor triggers 'this escape' warning | Use `@SuppressWarnings("this-escape")` or lazy initialization | `ProxiedWebView.java` |
+| `URL(String)` deprecated in Java 20+ | Use `URI.create(str).toURL()` instead | `ProxyServer.java`, `SSEHandler.java` |
+| JavaFX `setMember()` uses weak references | Bridge GC'd after install — hold strong `List<JSBridge>` reference | `ProxiedWebView.java` |
+| Proxy re-reads POST body from drained socket | POST blocks until read timeout — extract body from already-read `reqBuf` | `ProxyServer.java` |
+| `getOutputStream()` + explicit `connect()` = "Already connected" | Remove all explicit `conn.connect()` calls | `ProxyServer.java` |
+| pi-web uses relative EventSource URLs | Resolve relative SSE URLs against target origin | `SSEHandler.java` |
+| EventSource polyfill silently fails when bridge unavailable | Fall back to `NativeEventSource` on `postMessage` failure | `bridge.js` |
 
 ## File layout
 
@@ -208,6 +255,7 @@ webview-app/
     SSEHandler.java          # SSE event streaming
     AutoHello.java           # Dev-only auto "Hello" submission
     AppConfig.java           # Centralized configuration
+    ResourceUtil.java        # Classpath resource loading utility
     logging/
       AppLogger.java         # Centralized level-based logging
   src/main/resources/

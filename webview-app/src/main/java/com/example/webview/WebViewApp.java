@@ -41,8 +41,6 @@ public class WebViewApp extends Application {
 
     private static final AppLogger LOG = AppLogger.INSTANCE;
 
-    private static final String DEFAULT_URL = "http://127.0.0.1:30141";
-
     private ProxiedWebView proxiedWebView;
     private TextField addressBar;
 
@@ -56,11 +54,25 @@ public class WebViewApp extends Application {
         LOG.info("WebViewApp", "Initializing GUI");
 
         // Create the proxied WebView (GUI + proxy interposition)
-        proxiedWebView = new ProxiedWebView("127.0.0.1", 30141);
+        proxiedWebView = new ProxiedWebView(
+            AppConfig.TARGET_ORIGIN,
+            AppConfig.PROXY_HOST,
+            AppConfig.BUFFER_SIZE,
+            AppConfig.USER_AGENT,
+            AppConfig.CONNECT_TIMEOUT,
+            AppConfig.SSE_READ_TIMEOUT,
+            AppConfig.MAX_REQUEST_BODY_SIZE
+        );
 
         // Track page load completion
         proxiedWebView.setOnPageLoaded(() -> {
-            LOG.info("WebViewApp", "Page load completed callback fired");
+            if (AppConfig.AUTOHELLO_ENABLED) {
+                LOG.info("WebViewApp", "AutoHello enabled, injecting script");
+                String script = new AutoHello().script();
+                proxiedWebView.executeScriptAfterLoad(script);
+            } else {
+                LOG.info("WebViewApp", "AutoHello disabled");
+            }
         });
 
         // Start the proxy server
@@ -69,7 +81,7 @@ public class WebViewApp extends Application {
         // ---- Build the GUI ----
         addressBar = new TextField();
         addressBar.setPromptText("Enter a URL and press Enter (e.g. 127.0.0.1:30141)");
-        addressBar.setText(DEFAULT_URL);
+        addressBar.setText(AppConfig.TARGET_ORIGIN);
         HBox.setHgrow(addressBar, Priority.ALWAYS);
         addressBar.setOnAction(event -> {
             String url = addressBar.getText();
@@ -118,8 +130,8 @@ public class WebViewApp extends Application {
 
         // Defer navigation so the WebView2 control (Windows) finishes initializing
         Platform.runLater(() -> {
-            LOG.comm("WebViewApp", "ProxiedWebView", "INITIAL NAVIGATE", DEFAULT_URL);
-            proxiedWebView.navigateTo(DEFAULT_URL);
+            LOG.comm("WebViewApp", "ProxiedWebView", "INITIAL NAVIGATE", AppConfig.TARGET_ORIGIN);
+            proxiedWebView.navigateTo(AppConfig.TARGET_ORIGIN);
         });
     }
 

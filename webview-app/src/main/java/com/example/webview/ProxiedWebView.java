@@ -11,7 +11,10 @@ import javafx.scene.web.WebView;
 import netscape.javascript.JSObject;
 
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
 /**
@@ -30,7 +33,6 @@ import java.util.function.Consumer;
  *   - Rewrite target URLs to proxy URLs on navigate()
  *   - Install the JSBridge (console capture, postMessage, error capture)
  *   - Install the EventSource polyfill for SSE streaming
- *   - Optionally inject AutoHello (development only)
  *   - Route JS->Java messages (via JSBridge callback) to the SSEHandler
  *   - Log all communication between entities
  *
@@ -39,11 +41,10 @@ import java.util.function.Consumer;
  *   ProxiedWebView HAS-A ProxyServer
  *   ProxiedWebView HAS-A JSBridge
  *   ProxiedWebView HAS-A SSEHandler
- *   ProxiedWebView HAS-A AutoHello (optional)
  *   WebViewApp HAS-A ProxiedWebView
  *
  * Usage:
- *   ProxiedWebView view = new ProxiedWebView("127.0.0.1", 30141);
+ *   ProxiedWebView view = new ProxiedWebView(targetOrigin, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout, maxRequestBodySize);
  *   view.start();
  *   view.navigateTo("http://127.0.0.1:30141");
  *   Stage stage = new Stage();
@@ -56,9 +57,14 @@ public class ProxiedWebView extends BorderPane {
     private static final AppLogger LOG = AppLogger.INSTANCE;
 
     private final WebView webView;
-    private final ProxyServer proxy;
-    private final SSEHandler sseHandler;
-    private final AutoHello autoHello;
+    private ProxyServer proxy;
+    private final String targetOrigin;
+    private final String proxyHost;
+    private final int bufferSize;
+    private final String userAgent;
+    private final int connectTimeout;
+    private final int sseReadTimeout;
+    private final int maxRequestBodySize;
 
     private String currentUrl;
 
@@ -69,17 +75,44 @@ public class ProxiedWebView extends BorderPane {
     private Runnable onPageLoaded;
 
     /**
-     * Create a proxied WebView.
+     * Strong references to installed JSBridge objects.
      *
-     * @param targetHost target host (e.g. "127.0.0.1")
-     * @param targetPort target port (e.g. 30141)
+     * JavaFX WebKit stores objects passed to {@code setMember()} via WEAK
+     * references. Without a strong reference held on the Java side, the bridge
+     * is garbage-collected shortly after installation and every later
+     * {@code javaBridge.*} call from JS fails silently (all call sites in
+     * bridge.js / autoHello.js swallow exceptions), which kills console
+     * capture, the EventSource polyfill, and therefore all SSE replies.
      */
-    public ProxiedWebView(String targetHost, int targetPort) {
-        LOG.info("ProxiedWebView", "Creating with target " + targetHost + ":" + targetPort);
+    private final List<JSBridge> installedBridges = new CopyOnWriteArrayList<>();
 
-        this.proxy = new ProxyServer(targetHost, targetPort, 0);
-        this.sseHandler = new SSEHandler(this);
-        this.autoHello = new AutoHello();
+    /** Lazily initialized SSEHandler to avoid 'this' escape in constructor. */
+    private volatile SSEHandler sseHandler;
+
+    /**
+     * Create a proxied WebView with the given configuration.
+     */
+    @SuppressWarnings("this-escape")
+    public ProxiedWebView(
+        String targetOrigin,
+        String proxyHost,
+        int bufferSize,
+        String userAgent,
+        int connectTimeout,
+        int sseReadTimeout,
+        int maxRequestBodySize
+    ) {
+        this.targetOrigin = targetOrigin;
+        this.proxyHost = proxyHost;
+        this.bufferSize = bufferSize;
+        this.userAgent = userAgent;
+        this.connectTimeout = connectTimeout;
+        this.sseReadTimeout = sseReadTimeout;
+        this.maxRequestBodySize = maxRequestBodySize;
+
+        LOG.info("ProxiedWebView", "Creating with target " + targetOrigin);
+
+        this.proxy = new ProxyServer(targetOrigin, 0, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout, maxRequestBodySize);
 
         this.webView = new WebView();
         // Explicit sizes so WebView2 (Windows) gets a valid layout pass
@@ -109,7 +142,6 @@ public class ProxiedWebView extends BorderPane {
                 String loc = webView.getEngine().getLocation();
                 LOG.info("ProxiedWebView", "Page loaded: " + loc);
                 installJSBridge();
-                injectAutoHello();
                 if (onPageLoaded != null) {
                     LOG.debug("ProxiedWebView", "Running onPageLoaded callback");
                     onPageLoaded.run();
@@ -159,7 +191,11 @@ public class ProxiedWebView extends BorderPane {
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
             .replace("\n", "\\n")
-            .replace("\r", "\\r");
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+            .replace("\b", "\\b")
+            .replace("\f", "\\f")
+            .replace("</", "<\\/");
         String script = "if (typeof window.receiveMessageFromJava === 'function') { window.receiveMessageFromJava(\"" + escaped + "\"); }";
         LOG.comm("ProxiedWebView", "Page JS", "SEND_TO_PAGE",
             message.substring(0, Math.min(120, message.length())) + (message.length() > 120 ? "..." : ""));
@@ -181,11 +217,23 @@ public class ProxiedWebView extends BorderPane {
         return proxy;
     }
 
+    /** Get or create the SSEHandler (lazy initialization). */
+    private SSEHandler getSseHandler() {
+        if (sseHandler == null) {
+            synchronized (this) {
+                if (sseHandler == null) {
+                    sseHandler = new SSEHandler(this, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout);
+                }
+            }
+        }
+        return sseHandler;
+    }
+
     /** Start the proxy server. Must be called before {@link #navigateTo(String)}. */
     public void start() {
         try {
             proxy.start();
-            LOG.info("ProxiedWebView", "Proxy listening on " + AppConfig.getProxyHost() + ":" + proxy.getListenPort());
+            LOG.info("ProxiedWebView", "Proxy listening on " + proxyHost + ":" + proxy.getListenPort());
         } catch (Exception e) {
             LOG.error("ProxiedWebView", "Failed to start proxy: " + e.getMessage());
             throw new RuntimeException("Failed to start proxy", e);
@@ -195,7 +243,7 @@ public class ProxiedWebView extends BorderPane {
     /** Stop the proxy server and all SSE streams. Call this when the application exits. */
     public void stop() {
         LOG.info("ProxiedWebView", "Stopping...");
-        sseHandler.stopAll();
+        getSseHandler().stopAll();
         proxy.stop();
         LOG.info("ProxiedWebView", "Stopped");
     }
@@ -206,6 +254,11 @@ public class ProxiedWebView extends BorderPane {
         if (url == null) {
             return;
         }
+        String targetOrigin = extractTargetOrigin(url);
+        if (!targetOrigin.equals(proxy.getTargetOrigin())) {
+            LOG.info("ProxiedWebView", "Target origin changed: " + proxy.getTargetOrigin() + " -> " + targetOrigin + ", recreating proxy");
+            recreateProxy(targetOrigin);
+        }
         currentUrl = url;
         String proxyUrl = rewriteThroughProxy(url);
         LOG.comm("User", "ProxiedWebView", "NAVIGATE", rawUrl);
@@ -213,13 +266,66 @@ public class ProxiedWebView extends BorderPane {
         webView.getEngine().load(proxyUrl);
     }
 
-    /** Rewrite a target URL so it goes through the local proxy. */
-    private String rewriteThroughProxy(String url) {
-        return url.replaceFirst("^https?://" + proxy.getTargetOrigin().substring(7),
-            "http://" + AppConfig.getProxyHost() + ":" + proxy.getListenPort());
+    /** Extract target origin (scheme://host:port) from a full URL. */
+    private String extractTargetOrigin(String url) {
+        try {
+            URI uri = new URI(url);
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            int port = uri.getPort();
+            if (port == -1) {
+                port = ("https".equalsIgnoreCase(scheme)) ? 443 : 80;
+            }
+            return scheme + "://" + host + ":" + port;
+        } catch (Exception e) {
+            LOG.warn("ProxiedWebView", "Failed to extract target origin from: " + url);
+            return proxy.getTargetOrigin(); // fallback to current
+        }
     }
 
-    /** Adds https:// when the input has no scheme; returns null for blank input. */
+    /** Recreate proxy server with new target origin. */
+    private void recreateProxy(String newTargetOrigin) {
+        // Stop existing proxy
+        proxy.stop();
+        // Create new proxy with new target origin
+        this.proxy = new ProxyServer(newTargetOrigin, 0, proxyHost, bufferSize, userAgent, connectTimeout, sseReadTimeout, maxRequestBodySize);
+        // Restart proxy
+        try {
+            proxy.start();
+            LOG.info("ProxiedWebView", "Proxy recreated and listening on " + proxyHost + ":" + proxy.getListenPort());
+        } catch (Exception e) {
+            LOG.error("ProxiedWebView", "Failed to restart proxy: " + e.getMessage());
+            throw new RuntimeException("Failed to restart proxy", e);
+        }
+        // SSE handler needs to be recreated because it holds reference to old proxy
+        this.sseHandler = null; // will be lazily recreated via getSseHandler()
+    }
+
+    /** Rewrite a target URL so it goes through the local proxy. */
+    private String rewriteThroughProxy(String url) {
+        try {
+            URI uri = new URI(url);
+            String scheme = uri.getScheme();
+            if (scheme == null || (!scheme.equalsIgnoreCase("http") && !scheme.equalsIgnoreCase("https"))) {
+                LOG.warn("ProxiedWebView", "Unsupported scheme in URL: " + url);
+                return url;
+            }
+            // Proxy always speaks HTTP locally; target scheme is preserved via headers
+            String proxyUrl = "http://" + proxyHost + ":" + proxy.getListenPort()
+                + (uri.getPath().isEmpty() ? "/" : uri.getPath())
+                + (uri.getQuery() != null ? "?" + uri.getQuery() : "")
+                + (uri.getFragment() != null ? "#" + uri.getFragment() : "");
+            return proxyUrl;
+        } catch (Exception e) {
+            LOG.error("ProxiedWebView", "Failed to rewrite URL: " + url + " - " + e.getMessage());
+            return url; // fallback
+        }
+    }
+
+    /**
+     * Adds https:// when the input has no scheme; returns null for blank input.
+     * Defaults to HTTPS for security, but preserves user-specified scheme.
+     */
     private static String normalizeUrl(String raw) {
         if (raw == null) {
             return null;
@@ -228,17 +334,36 @@ public class ProxiedWebView extends BorderPane {
         if (url.isEmpty()) {
             return null;
         }
-        if (!url.matches("^[a-zA-Z][a-zA-Z0-9+.-]*://.*") && !url.startsWith("about:")) {
-            url = "https://" + url;
+        if (url.startsWith("about:")) {
+            return url;
         }
-        return url;
+        try {
+            URI uri = new URI(url);
+            if (uri.getScheme() == null) {
+                // No scheme - default to HTTPS
+                url = "https://" + url;
+            }
+            return url;
+        } catch (Exception e) {
+            // If URI parsing fails, apply simple heuristic
+            if (!url.matches("^[a-zA-Z][a-zA-Z0-9+.-]*://.*")) {
+                url = "https://" + url;
+            }
+            return url;
+        }
     }
 
     // ========================================================================
     // JS Bridge installation (idempotent)
     // ========================================================================
 
-    /** Set up the JS bridge and EventSource polyfill (idempotent). */
+    /**
+     * Set up the JS bridge and EventSource polyfill.
+     *
+     * Runs on every successful page load: a new document gets a fresh window
+     * object, so setMember() must be re-executed (bridge.js itself is guarded
+     * per-document by window.__piBridgeInstalled).
+     */
     private void installJSBridge() {
         try {
             JSObject window = (JSObject) webView.getEngine().executeScript("window");
@@ -255,13 +380,13 @@ public class ProxiedWebView extends BorderPane {
                 if (msg.startsWith("__PI_SSE_START__:")) {
                     String sseUrl = msg.substring("__PI_SSE_START__:".length());
                     LOG.comm("ProxiedWebView", "SSEHandler", "START", sseUrl);
-                    sseHandler.start(sseUrl);
+                    getSseHandler().start(sseUrl);
                     return;
                 }
                 if (msg.startsWith("__PI_SSE_STOP__:")) {
                     String sseUrl = msg.substring("__PI_SSE_STOP__:".length());
                     LOG.comm("ProxiedWebView", "SSEHandler", "STOP", sseUrl);
-                    sseHandler.stop(sseUrl);
+                    getSseHandler().stop(sseUrl);
                     return;
                 }
                 if (messageCallback != null) {
@@ -270,6 +395,10 @@ public class ProxiedWebView extends BorderPane {
                     LOG.warn("ProxiedWebView", "Received JS message but no messageCallback set: " + msg);
                 }
             });
+            // Hold a strong reference: WebKit keeps only a weak reference to
+            // setMember objects; without this the bridge is GC'd and all later
+            // JS->Java calls fail silently.
+            installedBridges.add(jsBridge);
             window.setMember("javaBridge", jsBridge);
 
             // Load the bridge script from classpath resource and execute it.
@@ -287,29 +416,22 @@ public class ProxiedWebView extends BorderPane {
         }
     }
 
-    /** Read a text resource from the classpath. */
+    /** Read a text resource from the classpath using ResourceUtil. */
     private static String readResource(String name) {
-        try (InputStream is = ProxiedWebView.class.getClassLoader().getResourceAsStream(name)) {
-            if (is == null) {
-                return null;
-            }
-            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
-        } catch (Exception e) {
-            LOG.error("ProxiedWebView", "Failed to read resource " + name + ": " + e.getMessage());
-            return null;
-        }
+        return ResourceUtil.readResource(name, ProxiedWebView.class);
     }
 
-    /** Inject the AutoHello script if enabled. */
-    private void injectAutoHello() {
-        if (!autoHello.isEnabled()) {
-            LOG.info("ProxiedWebView", "AutoHello disabled – skipping injection");
+    /**
+     * Execute arbitrary JavaScript after the page has loaded.
+     * Useful for injecting extensions.
+     *
+     * @param script JavaScript code to execute
+     */
+    public void executeScriptAfterLoad(String script) {
+        if (script == null || script.isEmpty()) {
             return;
         }
-        String script = autoHello.script();
-        if (!script.isEmpty()) {
-            LOG.info("ProxiedWebView", "Injecting AutoHello script");
-            webView.getEngine().executeScript(script);
-        }
+        LOG.info("ProxiedWebView", "Executing post-load script (" + script.length() + " chars)");
+        webView.getEngine().executeScript(script);
     }
 }

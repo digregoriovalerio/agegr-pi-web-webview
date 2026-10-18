@@ -24,6 +24,7 @@
     url: '',
     readyState: 0,
     _listeners: [],
+    _maxPendingSize: 100,  // Prevent unbounded growth
     flush: function() {
       if (this._pending.length === 0) return;
       var events = this._pending.splice(0, this._pending.length);
@@ -38,13 +39,13 @@
       }
     },
     addEventListener: function(type, handler) {
-      if (type === 'message') {
-        this._listeners.push({type: 'message', handler: handler});
+      if (type === 'message' || type === 'open' || type === 'error') {
+        this._listeners.push({type: type, handler: handler});
         this.flush();
       }
     },
     removeEventListener: function(type, handler) {
-      if (type === 'message') {
+      if (type === 'message' || type === 'open' || type === 'error') {
         for (var i = 0; i < this._listeners.length; i++) {
           if (this._listeners[i].handler === handler) {
             this._listeners.splice(i, 1);
@@ -59,14 +60,28 @@
       this._buffer = lines.pop();
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
-        if (line.startsWith("data: ")) {
-          var payload = line.substring(6);
-          var evt = new MessageEvent("message", {data: payload});
-          this._pending.push(evt);
+        var eventType = 'message';
+        var payload = '';
+        if (line.startsWith("event: ")) {
+          eventType = line.substring(7).trim();
+        } else if (line.startsWith("data: ")) {
+          payload = line.substring(6);
         } else if (line.startsWith("data:")) {
-          var payload = line.substring(5);
-          var evt = new MessageEvent("message", {data: payload});
+          payload = line.substring(5);
+        } else if (line.startsWith("id: ")) {
+          // Last-Event-ID - could be used for reconnection
+          this._lastEventId = line.substring(4).trim();
+        } else if (line.startsWith("retry: ")) {
+          // Reconnection delay - could be used for reconnection
+          this._retry = parseInt(line.substring(7).trim(), 10);
+        }
+        if (payload !== '') {
+          var evt = new MessageEvent(eventType, {data: payload});
           this._pending.push(evt);
+          // Prevent unbounded queue growth
+          if (this._pending.length > this._maxPendingSize) {
+            this._pending.shift(); // Drop oldest event
+          }
         }
       }
       this.flush();
@@ -99,24 +114,38 @@
       this.url = url;
       this.readyState = 0;
       this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
       this._closed = false;
-      this._buffer = "";
+      this._reconnectTimer = null;
+      this._withCredentials = options && options.withCredentials === true;
+      this._lastEventId = null;
 
+      var bridged = false;
       if (window.javaBridge) {
-        try { window.javaBridge.postMessage("__PI_SSE_START__:" + url); } catch(e) {}
-        this.readyState = 1;
-        if (this.onopen) this.onopen(new Event("open"));
-
-        window.__piSSE._closed = false;
-        window.__piSSE._buffer = '';
-        window.__piSSE._activeUrl = url;
-        window.__piSSE.url = url;
-        window.__piSSE.readyState = 1;
-        if (options && options.onmessage) { window.__piSSE.onmessage = options.onmessage; }
-        if (options && options.onerror) { window.__piSSE.onerror = options.onerror; }
-      } else {
+        try {
+          window.javaBridge.postMessage("__PI_SSE_START__:" + url);
+          bridged = true;
+        } catch (e) {
+          // javaBridge exists but is broken (e.g. GC'd bridge object) — fall back
+          try { window.javaBridge.log("[bridge] [EventSource] postMessage failed, falling back to native EventSource: " + e); } catch (e2) {}
+          bridged = false;
+        }
+      }
+      if (!bridged) {
         return new NativeEventSource(url, options);
       }
+
+      this.readyState = 1;
+      if (this.onopen) this.onopen(new Event("open"));
+
+      window.__piSSE._closed = false;
+      window.__piSSE._buffer = '';
+      window.__piSSE._activeUrl = url;
+      window.__piSSE.url = url;
+      window.__piSSE.readyState = 1;
+      if (options && options.onmessage) { window.__piSSE.onmessage = options.onmessage; }
+      if (options && options.onerror) { window.__piSSE.onerror = options.onerror; }
     };
 
     window.EventSource.CONNECTING = 0;
@@ -126,6 +155,10 @@
     window.EventSource.prototype.close = function() {
       this._closed = true;
       this.readyState = 2;
+      if (this._reconnectTimer) {
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+      }
       if (window.javaBridge) {
         try { window.javaBridge.postMessage("__PI_SSE_STOP__:" + this.url); } catch(e) {}
       }
@@ -135,6 +168,19 @@
         window.__piSSE.onerror = null;
         window.__piSSE._listeners = [];
       }
+    };
+
+    window.EventSource.prototype._scheduleReconnect = function() {
+      var self = this;
+      if (self._closed) return;
+      var delay = self._retry || 2000; // Default 2s, can be overridden by server
+      self._reconnectTimer = setTimeout(function() {
+        if (!self._closed) {
+          try {
+            window.javaBridge.postMessage("__PI_SSE_START__:" + self.url + (self._lastEventId ? ("?lastEventId=" + self._lastEventId) : ""));
+          } catch(e) {}
+        }
+      }, delay);
     };
 
     var origProto = window.EventSource.prototype;
@@ -151,6 +197,11 @@
     Object.defineProperty(origProto, 'onerror', {
       get: function() { return window.__piSSE ? window.__piSSE.onerror : null; },
       set: function(fn) { if (window.__piSSE) window.__piSSE.onerror = fn; },
+      configurable: true
+    });
+    Object.defineProperty(origProto, 'onopen', {
+      get: function() { return this._onopen; },
+      set: function(fn) { this._onopen = fn; },
       configurable: true
     });
   })();
