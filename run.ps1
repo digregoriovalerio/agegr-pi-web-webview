@@ -1,25 +1,69 @@
-# Convenience launcher for the WebView app (PowerShell).
-# Usage:
-#   ./run.ps1                          -> opens the default page
-#   ./run.ps1 https://127.0.0.1:30141      -> opens the given URL
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Runs the JavaFX WebView application.
+.DESCRIPTION
+    Sets up JAVA_HOME and MAVEN_HOME, launches the webview-app via Maven,
+    and restores the original working directory on exit.
 
+.PARAMETER LogLevel
+    Sets the application log level (TRACE, DEBUG, INFO, WARN, ERROR).
+    Default is DEBUG so you can see all directional communication between
+    components. Use INFO for normal operation, WARN/ERROR to reduce noise.
+#>
 param(
-    [Parameter(Position = 0)]
-    [string]$Url
+    [ValidateSet("TRACE", "DEBUG", "INFO", "WARN", "ERROR")]
+    [string]$LogLevel = "DEBUG",
+
+    [switch]$NoOpen
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 
-$BASE_DIR = $PSScriptRoot   # folder containing jdk/ and maven/
-$env:JAVA_HOME = Join-Path $BASE_DIR 'jdk'
-$env:PATH = "$($env:JAVA_HOME)\bin;$BASE_DIR\maven\bin;$env:PATH"
+# Remember original working directory
+$originalCwd = Get-Location
 
-Set-Location -Path (Join-Path $BASE_DIR 'webview-app')
+# Set up paths relative to this script location
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$javaHome = Join-Path $scriptDir "jdk"
+$mavenHome = Join-Path $scriptDir "maven"
+$webviewAppDir = Join-Path $scriptDir "webview-app"
 
-$mvnArgs = @('javafx:run')
-if ($PSBoundParameters.ContainsKey('Url')) {
-    $mvnArgs += "-DcommandlineArgs=$Url"
+# Validate JDK exists
+if (-not (Test-Path (Join-Path $javaHome "bin/java.exe"))) {
+    Write-Error "JDK not found at $javaHome"
+    exit 1
 }
 
-& mvn @mvnArgs
-cd ..
+# Validate Maven exists
+if (-not (Test-Path (Join-Path $mavenHome "bin/mvn.cmd"))) {
+    Write-Error "Maven not found at $mavenHome"
+    exit 1
+}
+
+# Set environment
+$env:JAVA_HOME = $javaHome
+$env:MAVEN_HOME = $mavenHome
+$env:PATH = "$javaHome\bin;$mavenHome\bin;$env:PATH"
+
+# Build JVM arguments for the JavaFX app: log level + autohello enabled by default
+$jvmArgs = "-Dpi.log.level=$LogLevel -Dpi.autohello.enabled=true"
+
+Write-Host "Starting JavaFX WebView app..." -ForegroundColor Cyan
+Write-Host "JAVA_HOME=$javaHome" -ForegroundColor Gray
+Write-Host "MAVEN_HOME=$mavenHome" -ForegroundColor Gray
+Write-Host "Working directory: $webviewAppDir" -ForegroundColor Gray
+Write-Host "Log level: $LogLevel" -ForegroundColor Gray
+Write-Host "JVM args: $jvmArgs" -ForegroundColor Gray
+
+try {
+    Push-Location $webviewAppDir
+    & "$mavenHome\bin/mvn.cmd" javafx:run "-Djavafx.run.jvmArguments=$jvmArgs"
+}
+finally {
+    Pop-Location
+    # Reset cwd to the original directory
+    Set-Location $originalCwd
+}
+
+Write-Host "Application stopped." -ForegroundColor Cyan
