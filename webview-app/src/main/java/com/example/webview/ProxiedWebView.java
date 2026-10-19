@@ -28,20 +28,20 @@ import java.util.function.Consumer;
  * local HTTP proxy ({@link ProxyServer}) to work around JavaFX WebView's
  * shortcomings with localhost servers:
  * <ul>
- *   <li>Origin checks — JavaFX sends the wrong Origin header to localhost</li>
- *   <li>User-Agent sniffing — pi-web rejects non-browser user agents</li>
- *   <li>SSE streaming — JavaFX does not expose native {@code EventSource}</li>
- *   <li>Chunked transfer encoding — JavaFX does not handle it reliably</li>
+ *   <li>Origin checks â€” JavaFX sends the wrong Origin header to localhost</li>
+ *   <li>User-Agent sniffing â€” pi-web rejects non-browser user agents</li>
+ *   <li>SSE streaming â€” JavaFX does not expose native {@code EventSource}</li>
+ *   <li>Chunked transfer encoding â€” JavaFX does not handle it reliably</li>
  * </ul>
  *
  * <h2>Architecture diagram</h2>
  * <pre>
- *   WebViewApp ──owns──> ProxiedWebView ──owns──> ProxyServer
- *                                  │              (HTTP proxy, header rewrite, chunked encoding)
- *                                  ├─owns──> SSEHandler  (SSE stream lifecycle, bounded pool)
- *                                  ├─owns──> AutoHello   (dev-only, removable)
- *                                  └─uses──> JSBridge    (window.javaBridge)
- *                                        ↑
+ *   WebViewApp â”€â”€ownsâ”€â”€> ProxiedWebView â”€â”€ownsâ”€â”€> ProxyServer
+ *                                  â”‚              (HTTP proxy, header rewrite, chunked encoding)
+ *                                  â”œâ”€ownsâ”€â”€> SSEHandler  (SSE stream lifecycle, bounded pool)
+ *                                  â”œâ”€ownsâ”€â”€> AutoHello   (dev-only, removable)
+ *                                  â””â”€usesâ”€â”€> JSBridge    (window.javaBridge)
+ *                                        â†‘
  *                              Page JS calls postMessage()
  * </pre>
  *
@@ -63,7 +63,7 @@ import java.util.function.Consumer;
  * every later {@code javaBridge.*} call from JavaScript fails silently (all
  * call sites in {@code bridge.js} and {@code autoHello.js} swallow exceptions
  * in try/catch blocks). This was the primary root cause of the "Hello message
- * never gets a reply" bug — once the bridge was GC'd, the EventSource polyfill
+ * never gets a reply" bug â€” once the bridge was GC'd, the EventSource polyfill
  * could no longer open SSE streams, so no replies ever reached the page.
  *
  * We fixed this by holding a {@link CopyOnWriteArrayList} of installed
@@ -254,11 +254,7 @@ public class ProxiedWebView extends BorderPane {
             .replace("\t", "\\t")
             .replace("\b", "\\b")
             .replace("\f", "\\f")
-            .replace("</", "<\\/")
-            // U+2028/U+2029 are JS line terminators and would break the generated
-            // script literal; escape them as Unicode sequences.
-            .replace("", "\\u2028")
-            .replace("", "\\u2029");
+            .replace("</", "<\\/");
         String script = "if (typeof window.receiveMessageFromJava === 'function') { window.receiveMessageFromJava(\"" + escaped + "\"); }";
         LOG.comm("ProxiedWebView", "Page JS", "SEND_TO_PAGE",
             message.substring(0, Math.min(120, message.length())) + (message.length() > 120 ? "..." : ""));
@@ -377,7 +373,7 @@ public class ProxiedWebView extends BorderPane {
             String scheme = uri.getScheme();
             String host = uri.getHost();
             if (host == null) {
-                // No host (e.g. about:blank) — cannot derive an origin; keep current proxy target.
+                // No host (e.g. about:blank) â€” cannot derive an origin; keep current proxy target.
                 return proxy.getTargetOrigin();
             }
             int port = uri.getPort();
@@ -396,7 +392,7 @@ public class ProxiedWebView extends BorderPane {
      * user navigates to a different origin than the one currently proxied.
      */
     private void recreateProxy(String newTargetOrigin) {
-        // Stop existing SSE streams first — they target the old origin and would
+        // Stop existing SSE streams first â€” they target the old origin and would
         // otherwise keep running (and orphan reader threads) against the old proxy.
         getSseHandler().stopAll();
         // Stop existing proxy
@@ -500,9 +496,9 @@ public class ProxiedWebView extends BorderPane {
      *
      * The bridge routes messages as follows:
      * <ul>
-     *   <li>{@code __PI_SSE_START__:url} — forwarded to {@link SSEHandler#start(String)}</li>
-     *   <li>{@code __PI_SSE_STOP__:url} — forwarded to {@link SSEHandler#stop(String)}</li>
-     *   <li>everything else — forwarded to the external {@link #messageCallback}</li>
+     *   <li>{@code __PI_SSE_START__:url} â€” forwarded to {@link SSEHandler#start(String)}</li>
+     *   <li>{@code __PI_SSE_STOP__:url} â€” forwarded to {@link SSEHandler#stop(String)}</li>
+     *   <li>everything else â€” forwarded to the external {@link #messageCallback}</li>
      * </ul>
      */
     private void installJSBridge() {

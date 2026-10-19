@@ -7,8 +7,8 @@
   //   Smoke-tests the end-to-end Hello → reply flow without manual user
   //   interaction. On page load it:
   //     1. Finds the chat input (tries multiple selectors in order)
-  //     2. Sets its value to "Hello" (React-compatible setter + input event)
-  //     3. Dispatches Enter keydown/keypress/keyup to submit
+  //     2. Sets its value to "Hello" (React-compatible setter + input/change events)
+  //     3. Clicks the send button (primary) or dispatches Enter (fallback)
   //     4. Verifies the textarea was cleared (indicating successful submit)
   //
   // LIFECYCLE:
@@ -24,8 +24,7 @@
   // LOGGING:
   //   All actions are logged via javaBridge.log("[autoHello] ..."). If the
   //   JSBridge has been garbage-collected (see ProxiedWebView), these logs
-  //   are silently swallowed — which is why the original "no reply" bug was
-  //   so hard to diagnose.
+  //   are silently swallowed.
   // ===========================================================================
 
   if (window.__piAutoHelloDone) return;
@@ -53,7 +52,7 @@
   }
 
   // Sets an input value using React-compatible native setter, then dispatches
-  // an input event so React's controlled component picks up the change.
+  // input AND change events so React's controlled component picks up the change.
   // Uses the correct prototype (HTMLInputElement vs HTMLTextAreaElement)
   // based on the element's tag name.
   function setInputValue(elem, newValue) {
@@ -70,16 +69,21 @@
     } else {
       elem.value = newValue;
     }
+    // Dispatch input event — React onChange listens for this.
     try {
-      var event = new Event('input', { bubbles: true });
-      Object.defineProperty(event, 'target', {
-        value: { value: elem.value, name: elem.name, id: elem.id },
-        enumerable: true
-      });
-      elem.dispatchEvent(event);
+      var inputEvent = new Event('input', { bubbles: true, cancelable: true });
+      elem.dispatchEvent(inputEvent);
       log("[setInputValue] dispatched input event, value='" + elem.value + "'");
     } catch(e) {
       log("[setInputValue] input event failed: " + e.message);
+    }
+    // Dispatch change event as well — some React setups listen for this.
+    try {
+      var changeEvent = new Event('change', { bubbles: true, cancelable: true });
+      elem.dispatchEvent(changeEvent);
+      log("[setInputValue] dispatched change event, value='" + elem.value + "'");
+    } catch(e) {
+      log("[setInputValue] change event failed: " + e.message);
     }
   }
 
@@ -93,26 +97,82 @@
     log("[dispatchEnter] Enter keydown/keypress/keyup dispatched");
   }
 
-  // Falls back to form submission or send-button click if Enter doesn't work.
+  // Find a send button near the input. Tries multiple selectors because chat
+  // UIs vary widely (icon buttons, submit buttons, aria-label buttons, etc.).
+  function findSendButton(input) {
+    var container = input.closest('form') || input.parentElement;
+    var root = container || document;
+
+    // 1. Form submit button
+    var btn = root.querySelector('button[type="submit"]');
+    if (btn) return btn;
+
+    // 2. Buttons with send-related aria-label or title
+    var labelSelectors = [
+      'button[aria-label*="send" i]',
+      'button[title*="send" i]',
+      'button[aria-label*="submit" i]',
+      'button[title*="submit" i]'
+    ];
+    for (var s = 0; s < labelSelectors.length; s++) {
+      btn = root.querySelector(labelSelectors[s]);
+      if (btn) return btn;
+    }
+
+    // 3. Buttons containing an SVG icon (common for send icons)
+    var svgBtns = root.querySelectorAll('button');
+    for (var b = 0; b < svgBtns.length; b++) {
+      if (svgBtns[b].querySelector('svg, i, [class*="send" i], [class*="submit" i]')) {
+        return svgBtns[b];
+      }
+    }
+
+    // 4. Any visible button near the input
+    var nearby = root.querySelectorAll('button');
+    for (var n = 0; n < nearby.length; n++) {
+      if (nearby[n] !== input && nearby[n].offsetParent !== null) {
+        return nearby[n];
+      }
+    }
+
+    return null;
+  }
+
+  // Clicks the send button if found.
+  function submitViaButton(input) {
+    var btn = findSendButton(input);
+    if (btn) {
+      log("[submitViaButton] found send button: " + (btn.className || 'no class') + ", tag: " + btn.tagName + ", disabled=" + btn.disabled);
+      if (btn.disabled) {
+        log("[submitViaButton] send button is disabled — cannot click");
+        return false;
+      }
+      try {
+        btn.click();
+        log("[submitViaButton] clicked send button");
+        return true;
+      } catch(e) {
+        log("[submitViaButton] button click failed: " + e.message);
+      }
+    } else {
+      log("[submitViaButton] no send button found");
+    }
+    return false;
+  }
+
+  // Falls back to form submission if button click doesn't work.
   function submitViaForm(input) {
     var form = input.closest('form');
     if (form) {
       log("[submitViaForm] submitting chat form");
-      try { form.requestSubmit ? form.requestSubmit() : form.submit(); return; } catch(e) {
+      try { form.requestSubmit ? form.requestSubmit() : form.submit(); return true; } catch(e) {
         log("[submitViaForm] form submit failed: " + e.message);
       }
     }
-    var container = form || input.parentElement;
-    var btn = container && container.querySelector('button[type="submit"], button[aria-label*="send" i], button[title*="send" i]');
-    if (btn) {
-      log("[submitViaForm] clicking chat send button");
-      btn.click();
-    } else {
-      log("[submitViaForm] no chat form/send button found — message may not have been sent");
-    }
+    return false;
   }
 
-  // Main retry loop: find input, type "Hello", dispatch Enter, verify submit.
+  // Main retry loop: find input, type "Hello", submit, verify.
   function trySendHello(attempt) {
     if (attempt === undefined) attempt = 0;
     if (attempt > 30) {
@@ -138,17 +198,36 @@
     setInputValue(input, "Hello");
     log("[trySendHello] set Hello value, input.value='" + input.value + "'");
 
+    // Give React time to process the input/change events before submitting.
     setTimeoutTracked(function() {
-      dispatchEnter(input);
+      // Primary: click the send button (more reliable than synthetic keyboard events in React).
+      var submitted = submitViaButton(input);
+
+      // Fallback: dispatch Enter key if button click didn't happen.
+      if (!submitted) {
+        log("[trySendHello] button click not performed, dispatching Enter");
+        dispatchEnter(input);
+      }
+
+      // Second fallback: form submission.
+      if (!submitted) {
+        submitted = submitViaForm(input);
+      }
+
+      // Wait longer for React to process submission and clear the textarea.
       setTimeoutTracked(function() {
         if (input.value === '') {
           log("[trySendHello] textarea cleared — Hello submitted");
         } else {
-          log("[trySendHello] textarea NOT cleared (value='" + input.value + "'), trying form submit");
-          submitViaForm(input);
+          log("[trySendHello] textarea NOT cleared (value='" + input.value + "'), will retry submission");
+          // Retry submission once more after a longer delay
+          setTimeoutTracked(function() {
+            submitViaButton(input);
+            submitViaForm(input);
+          }, 1500);
         }
-      }, 800);
-    }, 500);
+      }, 1500);
+    }, 1000);
   }
 
   function start() {
