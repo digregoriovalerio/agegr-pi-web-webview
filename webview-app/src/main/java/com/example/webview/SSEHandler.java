@@ -111,10 +111,13 @@ public class SSEHandler {
         }
     );
 
-    /** Per-stream state including running flag and leftover buffer. */
+    /** Per-stream state including running flag, leftover buffer, and the open stream so stop() can unblock a stalled reader. */
     private static class StreamState {
         final AtomicBoolean running = new AtomicBoolean(true);
         final StringBuilder leftover = new StringBuilder();
+        /** The reader's input stream; closed by {@link #stop(String)} / {@link #stopAll()} to unblock {@code in.read()}. */
+        volatile InputStream in;
+        volatile HttpURLConnection conn;
     }
 
     /** Tracks active SSE streams keyed by URL. */
@@ -211,6 +214,10 @@ public class SSEHandler {
                     return;
                 }
                 LOG.info("SSEHandler", "Got input stream, starting to read from " + fetchUrl);
+                // Publish the stream on the state so stop()/stopAll() can close it
+                // and unblock a reader blocked in in.read().
+                state.in = in;
+                state.conn = conn;
 
                 byte[] buf = new byte[bufferSize];
                 int read;
@@ -227,14 +234,11 @@ public class SSEHandler {
                     processSSEChunk(state);
                 }
 
-                // Flush any remaining data on normal stream end
-                if (state.leftover.length() > 0 && state.running.get()) {
-                    String remaining = state.leftover.toString().trim();
-                    if (!remaining.isEmpty()) {
-                        LOG.comm("SSEHandler", "Page", "SSE FLUSH",
-                            "Flushing remaining " + remaining.length() + " bytes");
-                        Platform.runLater(() -> proxiedWebView.sendToPage(remaining));
-                    }
+                // Per the SSE spec, an incomplete trailing event (no \n\n terminator)
+                // is discarded rather than delivered as a partial message.
+                if (state.leftover.length() > 0) {
+                    LOG.debug("SSEHandler", "Discarding " + state.leftover.length()
+                        + " bytes of incomplete trailing SSE data for " + fetchUrl);
                 }
 
                 LOG.info("SSEHandler", "Stream ended normally: " + fetchUrl + " (total bytes: " + totalBytes + ")");
@@ -287,13 +291,21 @@ public class SSEHandler {
         StreamState state = sseStreams.get(sseUrl);
         if (state != null) {
             state.running.set(false);
-            // Flush any remaining buffered data before removing
-            if (state.leftover.length() > 0) {
-                String remaining = state.leftover.toString().trim();
-                if (!remaining.isEmpty()) {
-                    LOG.comm("SSEHandler", "Page", "SSE FLUSH (on stop)",
-                        "Flushing remaining " + remaining.length() + " bytes");
-                    Platform.runLater(() -> proxiedWebView.sendToPage(remaining));
+            // Close the underlying stream to unblock a reader blocked in in.read().
+            // The reader thread owns leftover and flushes/discards on exit, so we do
+            // not touch it here (avoids cross-thread access to the StringBuilder).
+            InputStream in = state.in;
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                }
+            }
+            HttpURLConnection conn = state.conn;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
                 }
             }
             sseStreams.remove(sseUrl, state); // conditional remove to avoid race
@@ -309,13 +321,20 @@ public class SSEHandler {
         for (Map.Entry<String, StreamState> entry : sseStreams.entrySet()) {
             StreamState state = entry.getValue();
             state.running.set(false);
-            // Flush any remaining buffered data
-            if (state.leftover.length() > 0) {
-                String remaining = state.leftover.toString().trim();
-                if (!remaining.isEmpty()) {
-                    LOG.comm("SSEHandler", "Page", "SSE FLUSH (on stopAll)",
-                        "Flushing remaining " + remaining.length() + " bytes for " + entry.getKey());
-                    Platform.runLater(() -> proxiedWebView.sendToPage(remaining));
+            // Close the underlying stream to unblock any reader blocked in in.read().
+            // The reader thread owns leftover and flushes/discards on exit.
+            InputStream in = state.in;
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Exception ignored) {
+                }
+            }
+            HttpURLConnection conn = state.conn;
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
                 }
             }
             LOG.debug("SSEHandler", "Signalling stop for " + entry.getKey());

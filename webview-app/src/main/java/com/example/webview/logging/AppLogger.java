@@ -1,6 +1,8 @@
 package com.example.webview.logging;
 
 import com.example.webview.AppConfig;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 
 /**
  * Centralized level-based logging facade for the WebViewApp architecture.
@@ -137,6 +139,18 @@ public enum AppLogger {
     /** Log at ERROR level. */
     public void error(String source, String message) {
         emit(Level.ERROR, source, message);
+    }
+
+    /** Log at ERROR level, including the stack trace of the given throwable. */
+    public void error(String source, String message, Throwable t) {
+        emit(Level.ERROR, source, message + " -> " + t.getClass().getSimpleName() + ": " + t.getMessage());
+        StringWriter sw = new StringWriter();
+        PrintWriter pw = new PrintWriter(sw);
+        t.printStackTrace(pw);
+        pw.flush();
+        for (String line : sw.toString().split("\r?\n")) {
+            emit(Level.ERROR, source, "    " + line);
+        }
     }
 
     /**

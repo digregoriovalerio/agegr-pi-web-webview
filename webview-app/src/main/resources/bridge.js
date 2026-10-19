@@ -206,6 +206,24 @@
       }
     };
 
+    window.EventSource.prototype.addEventListener = function(type, handler) {
+      if (window.__piSSE && (type === 'message' || type === 'open' || type === 'error')) {
+        window.__piSSE._listeners.push({type: type, handler: handler});
+        window.__piSSE.flush();
+      }
+    };
+
+    window.EventSource.prototype.removeEventListener = function(type, handler) {
+      if (window.__piSSE && (type === 'message' || type === 'open' || type === 'error')) {
+        for (var i = 0; i < window.__piSSE._listeners.length; i++) {
+          if (window.__piSSE._listeners[i].handler === handler) {
+            window.__piSSE._listeners.splice(i, 1);
+            break;
+          }
+        }
+      }
+    };
+
     window.EventSource.prototype._scheduleReconnect = function() {
       var self = this;
       if (self._closed) return;

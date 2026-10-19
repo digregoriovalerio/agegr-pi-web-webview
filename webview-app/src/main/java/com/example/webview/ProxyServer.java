@@ -13,6 +13,7 @@ import java.net.URI;
 import java.net.URL;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -304,7 +305,24 @@ public class ProxyServer {
                 }
             }
 
-            int statusCode = conn.getResponseCode();
+            int statusCode;
+            try {
+                statusCode = conn.getResponseCode();
+            } catch (IOException e) {
+                LOG.warn("ProxyServer", "Target unreachable for " + method + " " + path + ": " + e.getMessage());
+                // Nothing written to client yet -> reply with 502 Bad Gateway.
+                String gatewayBody = "<html><body><h1>502 Bad Gateway</h1><p>Target unreachable: " + path + "</p></body></html>";
+                byte[] bodyBytes = gatewayBody.getBytes("UTF-8");
+                String resp = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html; charset=UTF-8\r\n"
+                    + "Content-Length: " + bodyBytes.length + "\r\nConnection: close\r\n\r\n" + gatewayBody;
+                try {
+                    clientOut.write(resp.getBytes("UTF-8"));
+                    clientOut.flush();
+                } catch (IOException ignored) {
+                }
+                LOG.comm("Proxy", "Client(" + connId + ")", "RESPONSE", "502 Bad Gateway for " + method + " " + path);
+                return;
+            }
             LOG.comm("Target(" + targetOrigin + ")", "Proxy", "RESPONSE",
                 statusCode + " " + conn.getResponseMessage() + " for " + method + " " + path);
 
@@ -322,6 +340,9 @@ public class ProxyServer {
                         name + ": " + value);
                 }
             }
+            // The proxy always closes the client socket after the response, so advertise
+            // Connection: close so clients don't wait for a keep-alive that will never come.
+            respHeaders.append("Connection: close\r\n");
 
             // ---- Get input stream ----
             InputStream targetIn;
@@ -373,8 +394,7 @@ public class ProxyServer {
                     + " (" + respBody.length + " bytes)");
             }
         } catch (Exception e) {
-            LOG.error("ProxyServer", method + " " + path + " -> error: " + e.getMessage());
-            e.printStackTrace();
+            LOG.error("ProxyServer", method + " " + path + " -> error: " + e.getMessage(), e);
         } finally {
             LOG.debug("ProxyServer", "Connection #" + connId + " (" + clientAddr + ") closed");
         }
@@ -563,7 +583,7 @@ public class ProxyServer {
      * @return the de-chunked body, or {@code null} if the buffer does not yet
      *         contain the complete chunked body (terminating 0-chunk consumed)
      */
-    private static byte[] tryDechunk(byte[] raw, int maxBodySize) throws IOException {
+    static byte[] tryDechunk(byte[] raw, int maxBodySize) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         int pos = 0;
         while (true) {
@@ -655,7 +675,7 @@ public class ProxyServer {
      * @return {@code true} if the path is valid, {@code false} if it is an
      *         absolute-form URI, contains path traversal, or is empty
      */
-    private static boolean isValidRequestPath(String path) {
+    static boolean isValidRequestPath(String path) {
         if (path == null || path.isEmpty()) {
             return false;
         }
@@ -667,8 +687,9 @@ public class ProxyServer {
         if (path.matches("^[a-zA-Z][a-zA-Z0-9+.-]*://.*")) {
             return false;
         }
-        // Basic path traversal protection
-        if (path.contains("../") || path.contains("..\\") || path.contains("%2e%2e")) {
+        // Basic path traversal protection (case-insensitive)
+        String lowerPath = path.toLowerCase(Locale.ROOT);
+        if (lowerPath.contains("../") || lowerPath.contains("..\\") || lowerPath.contains("%2e%2e")) {
             return false;
         }
         return true;

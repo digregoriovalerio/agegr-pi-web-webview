@@ -146,8 +146,8 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 | `SSE_READ_TIMEOUT` | `300000` | SSE stream read timeout (ms) |
 | `CONNECT_TIMEOUT` | `10000` | Connection timeout (ms) |
 | `MAX_REQUEST_BODY_SIZE` | `10485760` | Max request body size (bytes, 10MB) |
-| `AUTOHELLO_ENABLED` | `true` | Auto-type "Hello" on page load |
-| `LOG_LEVEL` | `TRACE` | Default log level |
+| `AUTOHELLO_ENABLED` | `false` | Auto-type "Hello" on page load (dev-only) |
+| `LOG_LEVEL` | `WARN` | Default log level |
 
 ## Fixes for missing Hello reply (this session)
 
@@ -185,6 +185,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 - Set `-LogLevel WARN` or `ERROR` to reduce log noise
 - Review `AppConfig.USER_AGENT` if the target server changes its browser sniffing
 - Ensure `ProxyServer` header rewrites (Origin/Referer) still match the target origin
+- `ProxyServer` strips `Set-Cookie` — cookie-based auth cannot work through the proxy (deliberate)
 
 ### Verification checklist (run after every change)
 
@@ -192,6 +193,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 - [ ] Logs appear at the configured level (`-LogLevel DEBUG` shows all inter-component comms)
 - [ ] AutoHello submits "Hello" on page load (unless disabled)
 - [ ] GUI shows the response to "Hello"
+- [ ] `./mvn test` passes (unit tests for proxy/path parsing)
 - [ ] No `System.out/err` in any Java file
 - [ ] No hardcoded `127.0.0.1`, `8192`, or User-Agent literals outside `AppConfig`
 - [ ] No inline JS strings longer than one line in Java files
@@ -199,7 +201,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 
 > **IMPORTANT**: Always run the application via `./run.ps1`. This script:
 > - Sets up `JAVA_HOME` and `MAVEN_HOME` correctly
-> - Passes required JVM arguments (`-Dpi.log.level`, `-Dpi.autohello.enabled`, etc.)
+> - Passes required JVM arguments (`-Dpi.log.level`, etc.)
 > - Runs pre-build compilation step
 > - Performs pi-web health check
 > - Restores working directory on exit
@@ -215,6 +217,15 @@ AGENTS.md must be updated with every modification to code, configuration, or arc
 4. Update configuration table if new system properties were introduced
 5. Update housekeeping rules if new constraints were discovered
 6. Update file layout if files were added/removed/moved
+
+## Behavior changes in this session
+- Address-bar / location sync now uses `startsWith("http://")` / `startsWith("https://")` (the previous `String.matches("^https?://")` never matched).
+- `normalizeUrl` defaults to `http://` for scheme-less input so local plain-HTTP targets (e.g. pi-web) are reachable.
+- Non-HTTP(S) URLs (e.g. `about:blank`) load directly without the proxy, so they cannot corrupt the proxy target origin or orphan SSE streams.
+- Unreachable targets now yield `502 Bad Gateway` instead of a silent socket close; all responses carry `Connection: close`.
+- SSE `stop()`/`stopAll()` close the underlying stream to unblock a blocked reader; incomplete trailing SSE data is discarded per spec.
+- EventSource polyfill now supports `addEventListener`/`removeEventListener`.
+- `printStackTrace()` replaced with `AppLogger.error(source, msg, throwable)`.
 
 ## Discoveries / Lessons Learned (token-saver for future sessions)
 

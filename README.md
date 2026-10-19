@@ -194,8 +194,10 @@ After any change, confirm:
 
 ```powershell
 cd webview-app
-./mvn.cmd package
+..\maven\bin\mvn.cmd package
 ```
+
+(The bundled `mvn.cmd` lives in `../maven/bin/`.)
 
 ## File layout
 

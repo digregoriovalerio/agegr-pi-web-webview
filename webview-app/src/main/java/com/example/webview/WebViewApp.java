@@ -126,7 +126,7 @@ public class WebViewApp extends Application {
 
         // Keep the address bar in sync when the user follows links inside the page
         proxiedWebView.getWebView().getEngine().locationProperty().addListener((obs, oldLoc, newLoc) -> {
-            if (newLoc != null && newLoc.matches("^https?://")) {
+            if (newLoc != null && (newLoc.startsWith("http://") || newLoc.startsWith("https://"))) {
                 Platform.runLater(() -> addressBar.setText(newLoc));
             }
         });

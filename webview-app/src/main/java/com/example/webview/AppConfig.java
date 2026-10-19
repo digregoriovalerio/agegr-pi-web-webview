@@ -34,8 +34,8 @@ import com.example.webview.logging.AppLogger;
  * </table>
  *
  * <h2>How logging level is resolved</h2>
- * Defaults to WARN when launched via {@code run.ps1}. The level can be changed at runtime via
- * {@code AppLogger.INSTANCE.setLevel(...)}.
+ * Defaults to WARN. Overridden by the {@code pi.log.level} system property (set by {@code run.ps1} -LogLevel).
+ * The level can be changed at runtime via {@code AppLogger.INSTANCE.setLevel(...)}.
  *
  * <h2>Production housekeeping</h2>
  * <ul>

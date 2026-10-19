@@ -46,7 +46,7 @@ public final class ResourceUtil {
 
         // Fallback to context classloader
         cl = Thread.currentThread().getContextClassLoader();
-        if (cl != sourceClass.getClassLoader()) {
+        if (cl != null && cl != sourceClass.getClassLoader()) {
             result = readResourceWithLoader(name, cl);
             if (result != null) {
                 return result;

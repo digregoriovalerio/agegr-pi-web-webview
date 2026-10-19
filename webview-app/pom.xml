@@ -24,7 +24,7 @@
 
     <!--
       Auto-select the JavaFX native classifier for the current OS/architecture.
-      This machine (Raspberry Pi 5, linux/aarch64) resolves to "linux-aarch64".
+      The OS-specific profiles below override ${javafx.platform} accordingly.
     -->
     <profiles>
         <profile>

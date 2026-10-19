@@ -181,8 +181,7 @@ public class ProxiedWebView extends BorderPane {
         // --- Diagnostics: load worker exceptions ---
         webView.getEngine().getLoadWorker().exceptionProperty().addListener((obs, oldEx, newEx) -> {
             if (newEx != null) {
-                LOG.error("ProxiedWebView", "Load worker exception: " + newEx.getMessage());
-                newEx.printStackTrace();
+                LOG.error("ProxiedWebView", "Load worker exception: " + newEx.getMessage(), newEx);
             }
         });
 
@@ -206,7 +205,7 @@ public class ProxiedWebView extends BorderPane {
 
         // --- Track location changes (for address bar sync by WebViewApp) ---
         webView.getEngine().locationProperty().addListener((ChangeListener<String>) (obs, oldLoc, newLoc) -> {
-            if (newLoc != null && newLoc.matches("^https?://") && !newLoc.equals(currentUrl)) {
+            if (newLoc != null && (newLoc.startsWith("http://") || newLoc.startsWith("https://")) && !newLoc.equals(currentUrl)) {
                 LOG.debug("ProxiedWebView", "Location changed: " + oldLoc + " -> " + newLoc);
                 currentUrl = newLoc;
             }
@@ -255,7 +254,11 @@ public class ProxiedWebView extends BorderPane {
             .replace("\t", "\\t")
             .replace("\b", "\\b")
             .replace("\f", "\\f")
-            .replace("</", "<\\/");
+            .replace("</", "<\\/")
+            // U+2028/U+2029 are JS line terminators and would break the generated
+            // script literal; escape them as Unicode sequences.
+            .replace(" ", "\\u2028")
+            .replace(" ", "\\u2029");
         String script = "if (typeof window.receiveMessageFromJava === 'function') { window.receiveMessageFromJava(\"" + escaped + "\"); }";
         LOG.comm("ProxiedWebView", "Page JS", "SEND_TO_PAGE",
             message.substring(0, Math.min(120, message.length())) + (message.length() > 120 ? "..." : ""));
@@ -332,16 +335,31 @@ public class ProxiedWebView extends BorderPane {
         if (url == null) {
             return;
         }
-        String targetOrigin = extractTargetOrigin(url);
-        if (!targetOrigin.equals(proxy.getTargetOrigin())) {
-            LOG.info("ProxiedWebView", "Target origin changed: " + proxy.getTargetOrigin() + " -> " + targetOrigin + ", recreating proxy");
-            recreateProxy(targetOrigin);
+        String scheme;
+        try {
+            scheme = new URI(url).getScheme();
+        } catch (Exception ignored) {
+            scheme = null;
         }
-        currentUrl = url;
-        String proxyUrl = rewriteThroughProxy(url);
-        LOG.comm("User", "ProxiedWebView", "NAVIGATE", rawUrl);
-        LOG.comm("ProxiedWebView", "Proxy", "REWRITE", url + " -> " + proxyUrl);
-        webView.getEngine().load(proxyUrl);
+        boolean proxied = "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+        if (proxied) {
+            String targetOrigin = extractTargetOrigin(url);
+            if (!targetOrigin.equals(proxy.getTargetOrigin())) {
+                LOG.info("ProxiedWebView", "Target origin changed: " + proxy.getTargetOrigin() + " -> " + targetOrigin + ", recreating proxy");
+                recreateProxy(targetOrigin);
+            }
+            currentUrl = url;
+            String proxyUrl = rewriteThroughProxy(url);
+            LOG.comm("User", "ProxiedWebView", "NAVIGATE", rawUrl);
+            LOG.comm("ProxiedWebView", "Proxy", "REWRITE", url + " -> " + proxyUrl);
+            webView.getEngine().load(proxyUrl);
+        } else {
+            // Non-HTTP(S) URLs (e.g. about:blank) load directly without the proxy so they
+            // cannot corrupt the proxy target origin or orphan SSE streams.
+            LOG.info("ProxiedWebView", "Loading non-proxied URL directly: " + url);
+            currentUrl = url;
+            webView.getEngine().load(url);
+        }
     }
 
     /**
@@ -355,6 +373,10 @@ public class ProxiedWebView extends BorderPane {
             URI uri = new URI(url);
             String scheme = uri.getScheme();
             String host = uri.getHost();
+            if (host == null) {
+                // No host (e.g. about:blank) — cannot derive an origin; keep current proxy target.
+                return proxy.getTargetOrigin();
+            }
             int port = uri.getPort();
             if (port == -1) {
                 port = ("https".equalsIgnoreCase(scheme)) ? 443 : 80;
@@ -371,6 +393,9 @@ public class ProxiedWebView extends BorderPane {
      * user navigates to a different origin than the one currently proxied.
      */
     private void recreateProxy(String newTargetOrigin) {
+        // Stop existing SSE streams first — they target the old origin and would
+        // otherwise keep running (and orphan reader threads) against the old proxy.
+        getSseHandler().stopAll();
         // Stop existing proxy
         proxy.stop();
         // Create new proxy with new target origin
@@ -385,6 +410,16 @@ public class ProxiedWebView extends BorderPane {
         }
         // SSE handler needs to be recreated because it holds reference to old proxy
         this.sseHandler = null; // will be lazily recreated via getSseHandler()
+    }
+
+    /**
+     * Drops all but the most recently installed {@link JSBridge}, preventing
+     * unbounded growth of the strong-reference list (one new bridge per page load).
+     */
+    private void pruneInstalledBridges() {
+        while (installedBridges.size() > 1) {
+            installedBridges.remove(0);
+        }
     }
 
     /**
@@ -421,7 +456,7 @@ public class ProxiedWebView extends BorderPane {
      * @param raw the raw user input
      * @return the normalized URL, or {@code null} if blank
      */
-    private static String normalizeUrl(String raw) {
+    static String normalizeUrl(String raw) {
         if (raw == null) {
             return null;
         }
@@ -435,14 +470,15 @@ public class ProxiedWebView extends BorderPane {
         try {
             URI uri = new URI(url);
             if (uri.getScheme() == null) {
-                // No scheme - default to HTTPS
-                url = "https://" + url;
+                // No scheme - default to HTTP so local plain-HTTP targets (e.g. pi-web)
+                // are reachable through the proxy.
+                url = "http://" + url;
             }
             return url;
         } catch (Exception e) {
             // If URI parsing fails, apply simple heuristic
             if (!url.matches("^[a-zA-Z][a-zA-Z0-9+.-]*://.*")) {
-                url = "https://" + url;
+                url = "http://" + url;
             }
             return url;
         }
@@ -501,6 +537,7 @@ public class ProxiedWebView extends BorderPane {
             // setMember objects; without this the bridge is GC'd and all later
             // JS->Java calls fail silently.
             installedBridges.add(jsBridge);
+            pruneInstalledBridges();
             window.setMember("javaBridge", jsBridge);
 
             // Load the bridge script from classpath resource and execute it.
@@ -513,8 +550,7 @@ public class ProxiedWebView extends BorderPane {
             webView.getEngine().executeScript(bridgeScript);
             LOG.info("ProxiedWebView", "JS bridge installed");
         } catch (Exception e) {
-            LOG.error("ProxiedWebView", "Failed to install JS bridge: " + e.getMessage());
-            e.printStackTrace();
+            LOG.error("ProxiedWebView", "Failed to install JS bridge: " + e.getMessage(), e);
         }
     }
 
