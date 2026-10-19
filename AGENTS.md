@@ -18,14 +18,6 @@ Tools: JDK (`./jdk`), Maven (`./maven`), PowerShell, Windows.
 ./run.ps1
 ```
 
-Defaults: `-LogLevel WARN` (shows all inter-component communication).
-
-Increase verbosity:
-
-```powershell
-./run.ps1 -LogLevel TRACE   # or DEBUG, INFO
-```
-
 Skip build (faster iteration):
 
 ```powershell
@@ -146,6 +138,8 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 | `SSE_READ_TIMEOUT` | `300000` | SSE stream read timeout (ms) |
 | `CONNECT_TIMEOUT` | `10000` | Connection timeout (ms) |
 | `MAX_REQUEST_BODY_SIZE` | `10485760` | Max request body size (bytes, 10MB) |
+| `SOCKET_TIMEOUT` | `300000` | Client socket read timeout (ms) |
+| `SSE_POOL_SIZE` | `4` | SSE reader thread pool size |
 | `AUTOHELLO_ENABLED` | `false` | Auto-type "Hello" on page load (dev-only) |
 | `LOG_LEVEL` | `WARN` | Default log level |
 
@@ -158,7 +152,6 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 | `getOutputStream()` + explicit `connect()` | `ProxyServer.java` | `getOutputStream()` implicitly connects; explicit `conn.connect()` afterward throws "Already connected". Fixed by removing all explicit `conn.connect()` calls. |
 | SSE relative URL resolution | `SSEHandler.java` | pi-web uses `new EventSource("/api/agent/${id}/events")` — relative URL. `URI.create(relative).toURL()` throws. Fixed by resolving against target origin. |
 | EventSource polyfill fallback | `bridge.js` | If `javaBridge.postMessage()` throws, polyfill silently failed. Fixed by catching failure and falling back to `NativeEventSource`. |
-| `-LogLevel` CLI parameter | `run.ps1` | Added `-LogLevel` parameter with `-Djavafx.run.jvmArguments=-Dpi.log.level=$LogLevel`. |
 
 ## Housekeeping (future maintenance)
 
@@ -182,7 +175,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 ### Production housekeeping
 
 - Set `AUTOHELLO_ENABLED = false` in `AppConfig.java` to remove AutoHello
-- Set `-LogLevel WARN` or `ERROR` to reduce log noise
+- Set `AppConfig.LOG_LEVEL` to `TRACE` for verbose logging
 - Review `AppConfig.USER_AGENT` if the target server changes its browser sniffing
 - Ensure `ProxyServer` header rewrites (Origin/Referer) still match the target origin
 - `ProxyServer` strips `Set-Cookie` — cookie-based auth cannot work through the proxy (deliberate)
@@ -190,7 +183,7 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 ### Verification checklist (run after every change)
 
 - [ ] `./run.ps1` starts without errors (MUST run via `./run.ps1` — NOT `mvn javafx:run` directly)
-- [ ] Logs appear at the configured level (`-LogLevel DEBUG` shows all inter-component comms)
+- [ ] Logs appear at the configured level (`AppConfig.LOG_LEVEL` set to `TRACE` shows all inter-component comms)
 - [ ] AutoHello submits "Hello" on page load (unless disabled)
 - [ ] GUI shows the response to "Hello"
 - [ ] `./mvn test` passes (unit tests for proxy/path parsing)
@@ -201,7 +194,6 @@ Set level at runtime: `AppLogger.INSTANCE.setLevel(AppLogger.Level.DEBUG)`.
 
 > **IMPORTANT**: Always run the application via `./run.ps1`. This script:
 > - Sets up `JAVA_HOME` and `MAVEN_HOME` correctly
-> - Passes required JVM arguments (`-Dpi.log.level`, etc.)
 > - Runs pre-build compilation step
 > - Performs pi-web health check
 > - Restores working directory on exit
@@ -226,6 +218,7 @@ AGENTS.md must be updated with every modification to code, configuration, or arc
 - SSE `stop()`/`stopAll()` close the underlying stream to unblock a blocked reader; incomplete trailing SSE data is discarded per spec.
 - EventSource polyfill now supports `addEventListener`/`removeEventListener`.
 - `printStackTrace()` replaced with `AppLogger.error(source, msg, throwable)`.
+- Low-severity hygiene: hardcoded timeouts/pool sizes moved to `AppConfig` (`SOCKET_TIMEOUT`, `SSE_POOL_SIZE`); `AppLogger` now defaults from `AppConfig.LOG_LEVEL`; dead `AppConfig` constructor removed; `Level.ordinal` renamed to `levelValue`; `ProxyServer.parseHeaders` skips the request line; request headers bounded at 64 KB; `autoHello.js` uses tag-name-aware value setter; SSE prefix constants shared via `JSBridge.SSE_START_PREFIX`/`SSE_STOP_PREFIX`; proxy thread names use a counter instead of `identityHashCode`; redundant `Platform.runLater` removed from address-bar listener; `ProxiedWebView.stop()` guards against null `sseHandler`.
 
 ## Discoveries / Lessons Learned (token-saver for future sessions)
 
@@ -234,7 +227,6 @@ AGENTS.md must be updated with every modification to code, configuration, or arc
 | JavaFX `WebView` is `final` | Cannot extend — use composition (`BorderPane` wrapper owning `WebView`) | `ProxiedWebView.java` |
 | PowerShell corrupts Java text blocks (`"""`) | Multi-line JS strings in Java files break compilation — load JS from `src/main/resources/*.js` via `readResource()` | `bridge.js`, `autoHello.js` |
 | `java.util.logging` is overridden by JDK's `logging.properties` | Logs disappear silently — use direct `System.out` with `AppLogger`, not `java.util.logging.Logger` | `AppLogger.java` |
-| Maven `javafx:run` ignores `-D` flags unless passed via jvmArguments | Use `-Djavafx.run.jvmArguments="-Dpi.log.level=DEBUG ..."` in `run.ps1` | `run.ps1` |
 | `run.ps1` must reset cwd on exit | Wrap `Push-Location`/`Pop-Location` in `try/finally` so the caller's cwd is restored | `run.ps1` |
 | AutoHello must be removable in production | Gate behind `pi.autohello.enabled` system property (default `true`) | `AutoHello.java`, `run.ps1` |
 | `AppConfig` centralizes all tunable values | User-Agent, buffer size, proxy/target host/port all in one place — no hardcoding | `AppConfig.java` |

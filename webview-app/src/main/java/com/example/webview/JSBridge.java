@@ -46,8 +46,10 @@ public class JSBridge {
 
     private static final AppLogger LOG = AppLogger.INSTANCE;
 
-    private static final String SSE_START_PREFIX = "__PI_SSE_START__:";
-    private static final String SSE_STOP_PREFIX = "__PI_SSE_STOP__:";
+    /** SSE protocol message prefix for starting a stream. */
+    public static final String SSE_START_PREFIX = "__PI_SSE_START__:";
+    /** SSE protocol message prefix for stopping a stream. */
+    public static final String SSE_STOP_PREFIX = "__PI_SSE_STOP__:";
 
     private final Consumer<String> messageCallback;
 

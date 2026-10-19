@@ -97,9 +97,9 @@ public class SSEHandler {
     private final int connectTimeout;
     private final int sseReadTimeout;
 
-    /** Executor for SSE reader threads (bounded pool, 4 threads). */
+    /** Executor for SSE reader threads (bounded pool, {@link AppConfig#SSE_POOL_SIZE} threads). */
     private final ExecutorService executor = Executors.newFixedThreadPool(
-        4,
+        AppConfig.SSE_POOL_SIZE,
         new ThreadFactory() {
             private final AtomicInteger counter = new AtomicInteger(0);
             @Override

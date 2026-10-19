@@ -257,8 +257,8 @@ public class ProxiedWebView extends BorderPane {
             .replace("</", "<\\/")
             // U+2028/U+2029 are JS line terminators and would break the generated
             // script literal; escape them as Unicode sequences.
-            .replace(" ", "\\u2028")
-            .replace(" ", "\\u2029");
+            .replace("", "\\u2028")
+            .replace("", "\\u2029");
         String script = "if (typeof window.receiveMessageFromJava === 'function') { window.receiveMessageFromJava(\"" + escaped + "\"); }";
         LOG.comm("ProxiedWebView", "Page JS", "SEND_TO_PAGE",
             message.substring(0, Math.min(120, message.length())) + (message.length() > 120 ? "..." : ""));
@@ -318,7 +318,10 @@ public class ProxiedWebView extends BorderPane {
      */
     public void stop() {
         LOG.info("ProxiedWebView", "Stopping...");
-        getSseHandler().stopAll();
+        // sseHandler is lazily created; don't create it just to shut it down.
+        if (sseHandler != null) {
+            sseHandler.stopAll();
+        }
         proxy.stop();
         LOG.info("ProxiedWebView", "Stopped");
     }
@@ -515,14 +518,14 @@ public class ProxiedWebView extends BorderPane {
             // external messageCallback (owned by WebViewApp).
             JSBridge jsBridge = new JSBridge(msg -> {
                 LOG.comm("JSBridge", "ProxiedWebView", "MESSAGE RECEIVED", msg);
-                if (msg.startsWith("__PI_SSE_START__:")) {
-                    String sseUrl = msg.substring("__PI_SSE_START__:".length());
+                if (msg.startsWith(JSBridge.SSE_START_PREFIX)) {
+                    String sseUrl = msg.substring(JSBridge.SSE_START_PREFIX.length());
                     LOG.comm("ProxiedWebView", "SSEHandler", "START", sseUrl);
                     getSseHandler().start(sseUrl);
                     return;
                 }
-                if (msg.startsWith("__PI_SSE_STOP__:")) {
-                    String sseUrl = msg.substring("__PI_SSE_STOP__:".length());
+                if (msg.startsWith(JSBridge.SSE_STOP_PREFIX)) {
+                    String sseUrl = msg.substring(JSBridge.SSE_STOP_PREFIX.length());
                     LOG.comm("ProxiedWebView", "SSEHandler", "STOP", sseUrl);
                     getSseHandler().stop(sseUrl);
                     return;

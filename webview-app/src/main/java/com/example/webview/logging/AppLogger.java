@@ -59,9 +59,9 @@ public enum AppLogger {
     public enum Level {
         TRACE(4), DEBUG(3), INFO(2), WARN(1), ERROR(0);
 
-        private final int ordinal;
-        Level(int ordinal) { this.ordinal = ordinal; }
-        public int value() { return ordinal; }
+        private final int levelValue;
+        Level(int levelValue) { this.levelValue = levelValue; }
+        public int value() { return levelValue; }
     }
 
     /** Maximum length for comm/commTrace messages before truncation. */

@@ -35,28 +35,18 @@ pi-web --no-open --port 30141
 JVM argument setup, pre-build compilation, and working-directory restoration.
 
 ```powershell
-# Default: DEBUG logging (shows all inter-component communication)
+# Default: WARN logging
 ./run.ps1
-
-# Less noise: only WARN and ERROR
-./run.ps1 -LogLevel WARN
-
-# Only errors
-./run.ps1 -LogLevel ERROR
 
 # Skip compilation (faster iteration when code hasn't changed)
 ./run.ps1 -SkipBuild
-
-# Skip compilation + minimal logging
-./run.ps1 -SkipBuild -LogLevel WARN
 ```
 
 The script:
 1. Sets `JAVA_HOME` and `MAVEN_HOME` to the bundled tools
 2. Compiles the project
-3. Passes `-Dpi.log.level=<level>` as a JVM argument to JavaFX
-4. Launches the JavaFX application
-5. Restores your original working directory on exit
+3. Launches the JavaFX application
+4. Restores your original working directory on exit
 
 ## Architecture
 
@@ -153,8 +143,6 @@ SSEHandler -> Page JS      (sendToPage → receiveMessageFromJava)
 Page JS -> AutoHello       (DOM interaction)
 ```
 
-Set the level at runtime: `./run.ps1 -LogLevel DEBUG` (default) or `-LogLevel WARN`/`ERROR` for less noise.
-
 ## Configuration
 
 All tunable values are in `AppConfig.java`. Do not hardcode `127.0.0.1`, `8192`,
@@ -175,7 +163,7 @@ or User-Agent strings outside this class.
 ### Production housekeeping
 
 - Set `AUTOHELLO_ENABLED = false` in `AppConfig.java` to remove AutoHello
-- Use `./run.ps1 -LogLevel WARN` or `-LogLevel ERROR` to reduce log noise
+- Set `AppConfig.LOG_LEVEL` to `TRACE` to increase log verbosity
 - Review `AppConfig.USER_AGENT` if the target server changes browser sniffing
 
 ## Verification checklist

@@ -109,10 +109,16 @@ public class ProxyServer {
     private final int sseReadTimeout;
     private final int maxRequestBodySize;
 
+    private final AtomicInteger connectionCounter = new AtomicInteger(0);
+    private final AtomicInteger threadCounter = new AtomicInteger(0);
+
+    /** Max size of request headers before giving up. */
+    private static final int MAX_HEADER_SIZE = 64 * 1024;
+
     private final ExecutorService executor = Executors.newFixedThreadPool(
         Runtime.getRuntime().availableProcessors() * 2,
         r -> {
-            Thread t = new Thread(r, "proxy-" + System.identityHashCode(r));
+            Thread t = new Thread(r, "proxy-" + threadCounter.incrementAndGet());
             t.setDaemon(true);
             return t;
         }
@@ -121,8 +127,6 @@ public class ProxyServer {
     private ServerSocket serverSocket;
     private int listenPort;
     private volatile boolean running = false;
-
-    private final AtomicInteger connectionCounter = new AtomicInteger(0);
 
     /**
      * Creates a proxy that forwards to the given target origin.
@@ -202,7 +206,7 @@ public class ProxyServer {
         String method = "UNKNOWN";
         String path = "/";
         try (clientSocket) {
-            clientSocket.setSoTimeout(300000);
+            clientSocket.setSoTimeout(AppConfig.SOCKET_TIMEOUT);
             InputStream clientIn = clientSocket.getInputStream();
             OutputStream clientOut = clientSocket.getOutputStream();
 
@@ -429,12 +433,14 @@ public class ProxyServer {
         int headerEnd = -1;
         
         while (headerEnd == -1) {
+            if (total > MAX_HEADER_SIZE) {
+                throw new IOException("Request headers too large");
+            }
             int read = in.read(buf, total, buf.length - total);
             if (read < 0) break;
             total += read;
             if (total >= 4) {
-                String partial = new String(buf, 0, total, "UTF-8");
-                headerEnd = partial.indexOf("\r\n\r\n");
+                headerEnd = indexOfHeaderEnd(buf);
             }
             if (headerEnd == -1 && total == buf.length) {
                 byte[] newBuf = new byte[buf.length * 2];
@@ -632,7 +638,10 @@ public class ProxyServer {
         Map<String, String> headers = new LinkedHashMap<>();
         String[] parts = reqStr.split("\r\n\r\n", 2);
         String headerPart = parts[0];
-        for (String line : headerPart.split("\r\n")) {
+        String[] lines = headerPart.split("\r\n");
+        // Skip the first line: it is the request line (e.g. "GET /path HTTP/1.1"), not a header.
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
             int colon = line.indexOf(':');
             if (colon > 0) {
                 String name = line.substring(0, colon).trim();

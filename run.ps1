@@ -15,27 +15,16 @@
 .PARAMETER SkipBuild
     Skips the Maven compile step (faster iteration when code hasn't changed).
 
-.PARAMETER LogLevel
-    Sets the application log level at startup via the -Dpi.log.level JVM
-    argument. Accepted values: TRACE, DEBUG, INFO, WARN, ERROR.
-    Default: DEBUG (shows all inter-component communication).
-
 .EXAMPLE
     ./run.ps1
-    Starts the app with DEBUG logging.
+    Starts the app with compilation.
 
 .EXAMPLE
-    ./run.ps1 -LogLevel WARN
-    Starts the app with WARN logging (less noise).
-
-.EXAMPLE
-    ./run.ps1 -SkipBuild -LogLevel ERROR
-    Skips compilation and shows only errors.
+    ./run.ps1 -SkipBuild
+    Skips compilation.
 #>
 param(
-    [switch]$SkipBuild,
-    [ValidateSet("TRACE", "DEBUG", "INFO", "WARN", "ERROR")]
-    [string]$LogLevel = "WARN"
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,9 +51,7 @@ try {
         if ($LASTEXITCODE -ne 0) { Write-Error "Compilation failed"; exit $LASTEXITCODE }
     }
 
-    # Pass the log level as a JVM argument so AppLogger picks it up.
-    # The JavaFX Maven plugin ignores -D flags unless passed via jvmArguments.
-    & "$mavenHome\bin/mvn.cmd" javafx:run "-Djavafx.run.jvmArguments=-Dpi.log.level=$LogLevel"
+    & "$mavenHome\bin/mvn.cmd" javafx:run
 }
 finally { Pop-Location; Set-Location $originalCwd }
 

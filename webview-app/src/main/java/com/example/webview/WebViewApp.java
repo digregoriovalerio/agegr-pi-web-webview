@@ -124,10 +124,11 @@ public class WebViewApp extends Application {
             proxiedWebView.navigateTo(url);
         });
 
-        // Keep the address bar in sync when the user follows links inside the page
+        // Keep the address bar in sync when the user follows links inside the page.
+        // The location listener runs on the JavaFX Application thread, so no runLater is needed.
         proxiedWebView.getWebView().getEngine().locationProperty().addListener((obs, oldLoc, newLoc) -> {
             if (newLoc != null && (newLoc.startsWith("http://") || newLoc.startsWith("https://"))) {
-                Platform.runLater(() -> addressBar.setText(newLoc));
+                addressBar.setText(newLoc);
             }
         });
 

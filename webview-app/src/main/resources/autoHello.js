@@ -54,9 +54,13 @@
 
   // Sets an input value using React-compatible native setter, then dispatches
   // an input event so React's controlled component picks up the change.
+  // Uses the correct prototype (HTMLInputElement vs HTMLTextAreaElement)
+  // based on the element's tag name.
   function setInputValue(elem, newValue) {
-    var valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value') ||
-                      Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'value');
+    var proto = elem.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+    var valueSetter = Object.getOwnPropertyDescriptor(proto, 'value');
     if (valueSetter && valueSetter.set) {
       try {
         valueSetter.set.call(elem, newValue);
